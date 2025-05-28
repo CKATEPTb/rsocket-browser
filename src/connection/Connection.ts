@@ -84,12 +84,13 @@ export class Connection<M, P> implements RSocket<M, P> {
         })
     }
 
-    public fireAndForget(metadata?: Mono<M>, payload?: Mono<P>): Mono<void> {
-        return this.normalize(metadata, payload)
-            .flatMap(({metadata, payload}) => {
-                this.requests.next(new RequestFireAndForgetFrame(this.streamId, FireAndForgetFlag.NONE, metadata, payload))
-                return Mono.empty()
+    public fireAndForget(metadata?: Mono<M>, payload?: Mono<P>): void {
+        this.normalize(metadata, payload)
+            .subscribe({
+                onNext: ({metadata, payload}) =>
+                    this.requests.next(new RequestFireAndForgetFrame(this.streamId, FireAndForgetFlag.NONE, metadata, payload))
             })
+            .request(1)
     }
 
     public requestResponse<R>(metadata?: Mono<M>, payload?: Mono<P>): Mono<R> {
@@ -215,11 +216,10 @@ export class Connection<M, P> implements RSocket<M, P> {
             })
     }
 
-    public metadataPush(metadata: Mono<Metadata<any>>): Mono<void> {
-        return metadata.flatMap(value => {
-            this.requests.next(new MetadataPushFrame(value))
-            return Mono.empty()
-        })
+    public metadataPush(metadata: Mono<Metadata<any>>): void {
+        metadata.subscribe({
+            onNext: value => this.requests.next(new MetadataPushFrame(value))
+        }).request(1)
     }
 
     public disconnect(): void {
