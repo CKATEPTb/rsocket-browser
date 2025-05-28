@@ -110,7 +110,7 @@ to implement and register custom serializers based on your MIME types.
 ### 1. Clone the repository:
 
 ```bash
-git clone https://github.com/CKATEPTb/rsocket-frames-ts.git
+git clone https://github.com/CKATEPTb/rsocket-browser.git
 ```
 
 ### 2. Install dependencies::
