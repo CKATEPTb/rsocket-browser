@@ -44,7 +44,6 @@ export type ConnectionOptions<M, P> = {
 }
 
 export class Connection<M, P> implements RSocket<M, P> {
-    private _streamId = -1
     protected readonly requests = new Emitter<Frame>()
     protected readonly responses = new Emitter<Frame>()
 
@@ -54,34 +53,10 @@ export class Connection<M, P> implements RSocket<M, P> {
         this.keepAlive()
     }
 
-    protected websocket() {
-        const websocket = new WebSocket(this.options.url)
-        websocket.binaryType = 'arraybuffer'
-        websocket.addEventListener("open", (_) => {
-            console.debug('websocket open event', websocket)
-            this.requests.addEmitHandler('next', (frame: Frame) => {
-                console.debug('websocket send event', frame, frame.toUint8Array())
-                websocket.send(frame.toUint8Array())
-            })
-            this.requests.addEmitHandler('complete', () => {
-                websocket.close()
-            })
-            this.requests.request(Number.MAX_SAFE_INTEGER)
-        })
-        websocket.addEventListener("error", ev => {
-            console.debug('websocket error event', websocket, ev)
-        })
-        websocket.addEventListener("close", ev => {
-            console.debug('websocket close event', websocket, ev)
-            this.responses.complete()
-        })
-        websocket.addEventListener("message", ev => {
-            this.responses.next(FrameDeserializer.deserialize(
-                new Uint8Array(ev.data),
-                this.options.setup.mimetype.metadata,
-                this.options.setup.mimetype.payload
-            ))
-        })
+    private _streamId = -1
+
+    protected get streamId() {
+        return this._streamId += 2
     }
 
     public fireAndForget(metadata?: Mono<M>, payload?: Mono<P>): void {
@@ -226,8 +201,34 @@ export class Connection<M, P> implements RSocket<M, P> {
         this.requests.complete()
     }
 
-    protected get streamId() {
-        return this._streamId += 2
+    protected websocket() {
+        const websocket = new WebSocket(this.options.url)
+        websocket.binaryType = 'arraybuffer'
+        websocket.addEventListener("open", (_) => {
+            console.debug('websocket open event', websocket)
+            this.requests.addEmitHandler('next', (frame: Frame) => {
+                console.debug('websocket send event', frame, frame.toUint8Array())
+                websocket.send(frame.toUint8Array())
+            })
+            this.requests.addEmitHandler('complete', () => {
+                websocket.close()
+            })
+            this.requests.request(Number.MAX_SAFE_INTEGER)
+        })
+        websocket.addEventListener("error", ev => {
+            console.debug('websocket error event', websocket, ev)
+        })
+        websocket.addEventListener("close", ev => {
+            console.debug('websocket close event', websocket, ev)
+            this.responses.complete()
+        })
+        websocket.addEventListener("message", ev => {
+            this.responses.next(FrameDeserializer.deserialize(
+                new Uint8Array(ev.data),
+                this.options.setup.mimetype.metadata,
+                this.options.setup.mimetype.payload
+            ))
+        })
     }
 
     protected setup(metadata?: Mono<M>, payload?: Mono<P>): void {

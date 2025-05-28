@@ -4,12 +4,12 @@ type Handler = (value?: any) => void
 
 export class Emitter<T> implements Sink<T>, Publisher<T>, Subscription {
     private readonly sink = Sinks.many().multicast<T>()
+    private readonly handlers = new Map<'next' | 'error' | 'complete', Set<Handler>>()
     private readonly subscription = Flux.from(this.sink).subscribe({
         onNext: (value: T) => this.handlers.get('next')?.forEach?.(handler => handler(value)),
         onError: (error: Error) => this.handlers.get('error')?.forEach?.(handler => handler(error)),
         onComplete: () => this.handlers.get('complete')?.forEach?.(handler => handler())
     })
-    private readonly handlers = new Map<'next' | 'error' | 'complete', Set<Handler>>()
 
     public addEmitHandler(type: 'next', handler: (value: T) => void): void;
     public addEmitHandler(type: 'error', handler: (value: Error) => void): void;
