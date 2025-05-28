@@ -16,6 +16,5 @@ export default defineConfig({
         options.alias = {
             '@': path.resolve(__dirname, 'src'),
         };
-    },
-    noExternal: ['rsocket-frames-ts']
+    }
 });
