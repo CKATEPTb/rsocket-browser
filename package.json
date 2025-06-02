@@ -1,6 +1,6 @@
 {
   "name": "rsocket-browser",
-  "version": "0.0.2-hotfix",
+  "version": "0.0.3-hotfix",
   "description": "The RSocket client implementation over websocket with browser compatibility based on Uint8Array",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

@@ -17,19 +17,19 @@ utilizing WebSocket as the transport layer.
 To install the package using **npm**:
 
 ```bash
-npm install rsocket-browser
+npm install rsocket-browser rsocket-frames-ts bebyte reactor-core-ts
 ```
 
 To install the package using **pnpm**:
 
 ```bash
-pnpm install rsocket-browser
+pnpm install rsocket-browser rsocket-frames-ts bebyte reactor-core-ts
 ```
 
 To install the package using **yarn**:
 
 ```bash
-yarn install rsocket-browser
+yarn install rsocket-browser rsocket-frames-ts bebyte reactor-core-ts
 ```
 
 ## 🧰 Usage
