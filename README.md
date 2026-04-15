@@ -28,6 +28,17 @@ The client itself targets the **browser** as its primary environment (WebSocket 
 
 ---
 
+## Protocol support
+
+| Feature | Status | Notes |
+|---|---|---|
+| `Transport` | WebSocket only | `TCP`, `Aeron`, and `HTTP/2 Stream` are not provided — this is a browser client. Custom transports can be built on top of [`rsocket-frames-ts`](https://www.npmjs.com/package/rsocket-frames-ts). |
+| `Core` | ✅ Implemented | `SETUP`, `KEEPALIVE`, `FIRE_AND_FORGET`, `REQUEST_RESPONSE`, `REQUEST_STREAM`, `REQUEST_CHANNEL`, `METADATA_PUSH`, `REQUEST_N`, `CANCEL`, `PAYLOAD`, `ERROR`, `EXT` |
+| `MimeType` | ✅ Implemented | Serialization and deserialization of both metadata and payload — see [`rsocket-frames-ts`](https://www.npmjs.com/package/rsocket-frames-ts) |
+| `Lease` / `Resume` / `RPC` | ❌ Not implemented | Can be implemented on top of [`rsocket-frames-ts`](https://www.npmjs.com/package/rsocket-frames-ts) using the [RSocket Protocol spec](https://github.com/rsocket/rsocket/blob/master/Protocol.md) |
+
+---
+
 ## Installation
 
 ```bash
