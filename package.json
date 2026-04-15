@@ -1,0 +1,54 @@
+{
+  "name": "rsocket-browser",
+  "version": "2.0.0",
+  "description": "The RSocket client implementation over websocket with browser compatibility based on Uint8Array",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts",
+    "start": "tsx src/start.ts",
+    "start:watch": "tsx watch src/start.ts"
+  },
+  "author": "CKATEPTb",
+  "license": "LGPL-3.0-only",
+  "devDependencies": {
+    "@types/node": "^22.15.24",
+    "ts-node": "^10.9.2",
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "keywords": [
+    "rsocket",
+    "websocket",
+    "client",
+    "connection",
+    "buffer",
+    "reactor",
+    "reactor-core",
+    "reactive",
+    "streams",
+    "reactive-streams",
+    "protocol",
+    "frame",
+    "uint8array",
+    "typescript",
+    "spec"
+  ],
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "bebyte": "^1.0.2",
+    "reactor-core-ts": "^2.1.6",
+    "rsocket-frames-ts": "^1.0.9"
+  }
+}
