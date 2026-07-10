@@ -1,30 +1,12 @@
 {
   "name": "rsocket-browser",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "The RSocket client implementation over websocket with browser compatibility based on Uint8Array",
-  "main": "./dist/index.js",
-  "module": "./dist/index.mjs",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
-    }
-  },
-  "scripts": {
-    "build": "tsup src/index.ts",
-    "start": "tsx src/start.ts",
-    "start:watch": "tsx watch src/start.ts"
-  },
-  "author": "CKATEPTb",
   "license": "LGPL-3.0-only",
-  "devDependencies": {
-    "@types/node": "^22.15.24",
-    "ts-node": "^10.9.2",
-    "tsup": "^8.5.0",
-    "tsx": "^4.19.4",
-    "typescript": "^5.8.3"
+  "author": "CKATEPTb",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CKATEPTb/rsocket-browser.git"
   },
   "keywords": [
     "rsocket",
@@ -43,12 +25,49 @@
     "typescript",
     "spec"
   ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "browser": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+    }
+  },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE.md",
+    "README.md"
   ],
+  "sideEffects": [
+    "./dist/index.js"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dist-aliases.mjs && node scripts/check-browser-package.mjs",
+    "test": "tsc -p tsconfig.json && npm run build && vitest run && node scripts/java-oracle-matrix.mjs && node scripts/check-api-parity.mjs --fail && npm pack --dry-run --json",
+    "generate-fixtures": "npm run build && node scripts/java-oracle-matrix.mjs --refresh"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10"
+  },
   "dependencies": {
     "bebyte": "^1.0.2",
-    "reactor-core-ts": "^2.1.6",
+    "reactor-core-ts": "^3.2.1",
     "rsocket-frames-ts": "^1.0.9"
   }
 }
