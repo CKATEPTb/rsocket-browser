@@ -1,17 +1,17 @@
 name: CI/CD
 
 on:
-  pull_request:
   push:
-  workflow_dispatch:
+    branches:
+      - production
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: ci-cd-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/production' }}
+  group: ci-cd-production
+  cancel-in-progress: false
 
 jobs:
   pipeline:
@@ -47,13 +47,11 @@ jobs:
         run: npm run build
 
       - name: Verify npm token
-        if: github.ref == 'refs/heads/production' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: test -n "$NODE_AUTH_TOKEN"
 
       - name: Publish to npm
-        if: github.ref == 'refs/heads/production' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public --ignore-scripts
