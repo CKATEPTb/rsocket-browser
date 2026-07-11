@@ -42,6 +42,7 @@ export function normalizeWebSocketEndpoint(
 ): NormalizedWebSocketEndpoint {
     const parsed = parseWebSocketUrl(url);
     normalizeWebSocketScheme(parsed);
+    rejectWebSocketCredentials(parsed);
     rejectWebSocketFragment(parsed);
 
     const normalizedProtocols = protocols === undefined
@@ -51,6 +52,13 @@ export function normalizeWebSocketEndpoint(
     return normalizedProtocols === undefined
         ? {url: parsed.href}
         : {url: parsed.href, protocols: normalizedProtocols};
+}
+
+/** Rejects user-info because the browser WebSocket constructor forbids it. */
+function rejectWebSocketCredentials(url: URL): void {
+    if (url.username !== "" || url.password !== "") {
+        throw new RSocketConnectionError("Invalid WebSocket URL. Credentials are not allowed.");
+    }
 }
 
 /**

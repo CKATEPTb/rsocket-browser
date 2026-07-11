@@ -59,7 +59,13 @@ export function webSocketMessageBytes(socket: RSocketWebSocket): Flux<Uint8Array
             }
 
             if (data instanceof Uint8Array && queuedTasks === 0) {
-                if (!sink.isCancelled()) sink.next(data);
+                if (!sink.isCancelled()) {
+                    try {
+                        sink.next(data);
+                    } catch (error) {
+                        fail(error);
+                    }
+                }
                 return;
             }
 

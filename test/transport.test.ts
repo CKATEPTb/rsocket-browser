@@ -141,6 +141,15 @@ describe("WebSocket transport", () => {
         undefined
       )
     ).toThrow("Fragments are not allowed");
+
+    expect(() =>
+      createReactiveWebSocketConnection(
+        fakeWebSocketFactory(new FakeWebSocket()),
+        "wss://user:secret@example.com/rsocket",
+        undefined,
+        undefined
+      )
+    ).toThrow("Credentials are not allowed");
   });
 
   it("rejects invalid or duplicate WebSocket subprotocol values", () => {

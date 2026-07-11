@@ -11,5 +11,5 @@ export function defaultWebSocketFactory(url: string | URL, protocols?: string | 
     if (typeof WebSocket === "undefined") {
         throw new RSocketConnectionError("WebSocket is not available in this runtime");
     }
-    return new WebSocket(url, protocols) as RSocketWebSocket;
+    return (protocols === undefined ? new WebSocket(url) : new WebSocket(url, protocols)) as RSocketWebSocket;
 }
