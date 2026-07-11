@@ -1,6 +1,6 @@
 {
   "name": "rsocket-browser",
-  "version": "3.0.0",
+  "version": "3.3.8",
   "description": "The RSocket client implementation over websocket with browser compatibility based on Uint8Array",
   "license": "LGPL-3.0-only",
   "author": "CKATEPTb",
