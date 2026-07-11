@@ -14,11 +14,11 @@ const DONE_PROMISE = Promise.resolve(DONE);
  * @typeParam T - Value type delivered by the queue.
  */
 export class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
-    private readonly values: T[] = [];
+    private readonly values: Array<T | undefined> = [];
     private readonly waiters: Array<{
         resolve: (result: IteratorResult<T>) => void;
         reject: (error: unknown) => void;
-    }> = [];
+    } | undefined> = [];
     private readIndex = 0;
     private waiterIndex = 0;
     private closed = false;
@@ -68,6 +68,7 @@ export class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
     next(): Promise<IteratorResult<T>> {
         if (this.readIndex < this.values.length) {
             const value = this.values[this.readIndex] as T;
+            this.values[this.readIndex] = undefined;
             this.readIndex += 1;
             this.compact();
             return Promise.resolve({done: false, value});
@@ -137,6 +138,7 @@ export class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
     } | undefined {
         if (this.waiterIndex >= this.waiters.length) return undefined;
         const waiter = this.waiters[this.waiterIndex];
+        this.waiters[this.waiterIndex] = undefined;
         this.waiterIndex += 1;
         this.compactWaiters();
         return waiter;
