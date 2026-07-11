@@ -5,8 +5,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
-/** Workspace-only API probe that must be typechecked but never published. */
-const sourceLayoutExemptions = new Set([path.normalize("src/temp-test.ts")]);
 
 assert.deepStrictEqual(Object.keys(packageJson.exports), ["."], "package must expose only the root entry");
 assert.deepStrictEqual(
@@ -54,14 +52,13 @@ function assertFile(file) {
 function assertSourceLayout() {
   const entries = readdirSync("src", { withFileTypes: true });
   for (const entry of entries) {
-    const file = path.normalize(path.join("src", entry.name));
-    if (entry.isFile() && !sourceLayoutExemptions.has(file)) {
+    if (entry.isFile()) {
       assert.equal(entry.name, "index.ts", "src root may contain only index.ts files");
     }
   }
 
   let internalRelativeImports = 0;
-  for (const file of tsFiles("src").filter((file) => !sourceLayoutExemptions.has(path.normalize(file)))) {
+  for (const file of tsFiles("src")) {
     const source = readFileSync(file, "utf8");
     if (/from\s+["']\.\.?\//.test(source) || /export\s+.+from\s+["']\.\.?\//.test(source)) {
       internalRelativeImports += 1;
