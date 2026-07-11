@@ -1,225 +1,664 @@
 # rsocket-browser
 
-> A fully spec-compliant, TypeScript-first RSocket client for the browser — built from scratch because the original had to be.
-
-[![npm version](https://img.shields.io/npm/v/rsocket-browser)](https://www.npmjs.com/package/rsocket-browser)
-[![license](https://img.shields.io/badge/license-LGPL--3.0--only-blue)](./LICENSE.md)
-
----
-
-## Why this exists
-
-The original [rsocket-js](https://github.com/rsocket/rsocket-js) was effectively abandoned. The `0.x` line shipped without TypeScript support, had a brittle codebase, and implemented only a subset of the spec. The `1.x` line promised to fix all of that — and spent several years not leaving `alpha`. Meanwhile, production systems were already running on RSocket.
-
-This library is the result of needing a real, working RSocket client that could be trusted in production.
-
----
-
-## What makes it different
-
-Everything.
-
-Rather than patching the original, this was built from the ground up using two companion libraries that also had to be written first:
-
-- **[rsocket-frames-ts](https://github.com/CKATEPTb/rsocket-frames-ts)** — a full implementation of the RSocket frame spec using `Uint8Array` with flexible, type-safe encoders/decoders for every MIME type. Supports [custom serializer/deserializer definitions](https://github.com/CKATEPTb/rsocket-frames-ts?tab=readme-ov-file#describe-your-own-serializerdeserializer-for-mimetype).
-- **[reactor-core-ts](https://github.com/CKATEPTb/reactor-core-ts)** — a minimal TypeScript port of Project Reactor (`Mono`, `Flux`, back-pressure, schedulers). All interaction models are reactive from top to bottom.
-
-The client itself targets the **browser** as its primary environment (WebSocket transport, `Uint8Array` binary frames, no Node.js-specific APIs), though the underlying frame implementation covers the full spec and can be used outside the browser just as well.
-
----
-
-## Protocol support
-
-| Feature | Status | Notes |
-|---|---|---|
-| `Transport` | WebSocket only | `TCP`, `Aeron`, and `HTTP/2 Stream` are not provided — this is a browser client. Custom transports can be built on top of [`rsocket-frames-ts`](https://www.npmjs.com/package/rsocket-frames-ts). |
-| `Core` | ✅ Implemented | `SETUP`, `KEEPALIVE`, `FIRE_AND_FORGET`, `REQUEST_RESPONSE`, `REQUEST_STREAM`, `REQUEST_CHANNEL`, `METADATA_PUSH`, `REQUEST_N`, `CANCEL`, `PAYLOAD`, `ERROR`, `EXT` |
-| `MimeType` | ✅ Implemented | Serialization and deserialization of both metadata and payload — see [`rsocket-frames-ts`](https://www.npmjs.com/package/rsocket-frames-ts) |
-| `Lease` / `Resume` / `RPC` | ❌ Not implemented | Can be implemented on top of [`rsocket-frames-ts`](https://www.npmjs.com/package/rsocket-frames-ts) using the [RSocket Protocol spec](https://github.com/rsocket/rsocket/blob/master/Protocol.md) |
-
----
-
-## Installation
+`rsocket-browser` is a browser-first TypeScript RSocket requester for any backend
+that exposes RSocket over WebSocket. It provides all four RSocket interaction
+models, Reactive Streams backpressure, typed metadata codecs, reconnect, Resume,
+fragmentation, and class-based route controllers.
 
 ```bash
-npm install rsocket-browser rsocket-frames-ts reactor-core-ts bebyte
+npm install rsocket-browser
 ```
 
----
+`reactor-core-ts`, `rsocket-frames-ts`, and `bebyte` are installed automatically
+as runtime dependencies. Import the client and controllers from
+`rsocket-browser`; import MIME codecs and protocol metadata helpers from
+`rsocket-frames-ts`.
 
-## Quick start
+The package is ESM-only and works with Vite, Webpack, Rollup, and modern
+framework build systems. Its transport boundary is intentionally WebSocket,
+not TCP. It is not tied to Spring Boot or any other server framework.
 
-```typescript
+## Quick Start
+
+```ts
 import { RSocket } from "rsocket-browser";
-import { WellKnownAuthType, WellKnownMimeType } from "rsocket-frames-ts";
-import { Flux, Mono } from "reactor-core-ts";
+import { WellKnownMimeType } from "rsocket-frames-ts";
 
-const socket = RSocket.create({
-    url: "wss://example.com/ws",
-    setup: {
-        keepAlive: 30_000,   // ms between keepalive probes
-        lifetime: 90_000,    // ms before the connection is considered dead
-        mimetype: {
-            data:     WellKnownMimeType.APPLICATION_JSON,
-            metadata: WellKnownMimeType.MESSAGE_RSOCKET_ROUTING,
-        },
-    },
-    logs: {
-        inbound:  true,  // log every inbound frame
-        outbound: true,  // log every outbound frame
-    },
+const routing = WellKnownMimeType.MESSAGE_RSOCKET_ROUTING;
+const route = (name: string) => routing.toMetadata([name]);
+
+const socket = new RSocket("wss://api.example.com/rsocket", {
+  setup: {
+    keepAlive: 20_000,
+    lifetime: 90_000,
+    mimetype: {
+      data: WellKnownMimeType.APPLICATION_JSON,
+      metadata: WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA
+    }
+  }
+});
+
+const connection = await socket.connect().block();
+if (!connection) throw new Error("RSocket connection did not open");
+
+const response = await connection
+  .requestResponse({ id: 42 }, route("user.find"))
+  .block();
+
+console.log(response?.data);
+```
+
+The routing entry is automatically wrapped in composite metadata because the
+SETUP metadata MIME is composite. You do not need to construct a composite
+container for a single route.
+
+## API At A Glance
+
+Direct interactions use one compact positional shape:
+
+```ts
+connection.fireAndForget(data?, metadata?, mimetype?);
+connection.requestResponse(data?, metadata?, mimetype?);
+connection.requestStream(data?, metadata?, mimetype?);
+connection.requestChannel(source?, metadata?, mimetype?);
+```
+
+- `data` is a value encoded by the data MIME, or an already encoded `Payload`.
+- `metadata` is a value encoded by the metadata MIME, or a typed `Metadata`.
+- `mimetype` optionally overrides codecs as `{ data, metadata }` for that call.
+- `source` is a Publisher, `Flux`, iterable, or async iterable of channel items.
+- Calling `requestChannel()` without a source returns an imperative channel sink.
+
+| Interaction | Result | Purpose |
+| --- | --- | --- |
+| `fireAndForget` | `Mono<void>` | Send one message without a response. |
+| `requestResponse` | `Mono<PayloadFrame>` | Send one request and receive at most one response. |
+| `requestStream` | `Flux<PayloadFrame>` | Receive a demand-controlled response stream. |
+| `requestChannel` | `Flux<PayloadFrame>` or channel sink | Exchange demand-controlled streams in both directions. |
+
+`connect()` and every interaction are lazy. A frame is sent only after the
+returned `Mono` or `Flux` is subscribed, blocked, or consumed with
+`for await ... of`.
+
+## Direct Interactions
+
+### Fire And Forget
+
+```ts
+await connection
+  .fireAndForget(
+    { page: "/pricing", at: Date.now() },
+    route("analytics.page-view")
+  )
+  .block();
+```
+
+Completion means the frame was written to the active WebSocket. It does not
+mean the server processed the message.
+
+### Request Response
+
+```ts
+const response = await connection
+  .requestResponse({ id: 42 }, route("user.find"))
+  .block();
+
+console.log(response?.data);
+console.log(response?.metadata);
+```
+
+The result also exposes the decoded `frame`, `dataPayload`, and
+`metadataPayload` when lower-level protocol access is needed.
+
+### Request Stream
+
+```ts
+const users = connection.requestStream(
+  { teamId: 7 },
+  route("users.watch")
+);
+
+users.subscribe({
+  onSubscribe(subscription) {
+    subscription.request(20);
+  },
+  onNext(payload) {
+    console.log(payload.data);
+  },
+  onError(error) {
+    console.error(error);
+  },
+  onComplete() {
+    console.log("stream complete");
+  }
 });
 ```
 
----
+The initial and later `request(n)` calls become RSocket demand. The responder
+cannot deliver more items than the client has requested. Cancelling the
+subscription sends `CANCEL`.
 
-## Connection lifecycle
+### Request Channel
 
-```typescript
-// Connect — returns a Mono<void> that completes once the SETUP handshake is done.
-await socket.connect().toPromise();
+Use the sink form when UI actions produce outbound messages over time:
 
-// Check connection state at any time.
-console.log(socket.isConnected()); // true
+```ts
+const channel = connection.requestChannel(
+  undefined,
+  route("chat.messages")
+);
 
-// Graceful disconnect — drains the outbound queue before closing.
-socket.disconnect().doFinally(() => {
-    console.log("disconnected");
-}).subscribe();
+channel.subscribe({
+  onSubscribe(subscription) {
+    subscription.request(50);
+  },
+  onNext(payload) {
+    console.log("received", payload.data);
+  },
+  onError(error) {
+    console.error(error);
+  },
+  onComplete() {
+    console.log("channel complete");
+  }
+});
 
-// Force disconnect — closes immediately without draining.
-socket.disconnect(true).subscribe();
+channel.next({ room: "general", text: "Hello" });
+channel.next({ room: "general", text: "World" });
+channel.complete();
 ```
 
----
+Outbound items are buffered and sent only when the responder requests them.
+Inbound items are delivered only against local demand.
 
-## Interaction models
+Use a publisher when the outbound source already exists:
+
+```ts
+async function* messages() {
+  yield { room: "general", text: "Hello" };
+  yield { room: "general", text: "World" };
+}
+
+const replies = connection.requestChannel(
+  messages(),
+  route("chat.messages")
+);
+
+for await (const reply of replies) {
+  console.log(reply.data);
+}
+```
+
+## Setup And Types
+
+The two constructor forms are equivalent:
+
+```ts
+new RSocket("wss://api.example.com/rsocket", options);
+new RSocket({ url: "wss://api.example.com/rsocket", ...options });
+```
+
+The public options are intentionally small:
+
+| Option | Meaning |
+| --- | --- |
+| `setup.keepAlive` | Milliseconds between requester KEEPALIVE frames. |
+| `setup.lifetime` | Maximum silence before the connection is considered dead. |
+| `setup.mimetype.data` | Codec used for data payloads. |
+| `setup.mimetype.metadata` | Codec used for metadata payloads. |
+| `setup.payload` | Optional payload included in the SETUP frame. |
+| `setup.transport` | Optional `(url) => WebSocketLike` factory. |
+| `reconnect` | Enables/disables reconnect and optionally configures Resume. |
+| `events` | Constructor-time connection lifecycle handlers. |
+| `log` | Frame, lifecycle, and interaction logging. |
+
+The browser `WebSocket` constructor is used by default. A compatible wrapper
+can be supplied without exposing a TCP transport:
+
+```ts
+const socket = new RSocket("wss://api.example.com/rsocket", {
+  setup: {
+    transport: (url) => new WebSocket(url)
+  }
+});
+```
+
+The generic data and metadata types are inferred from typed SETUP MIME codecs.
+For example, `TEXT_PLAIN` makes direct data arguments and response data
+`string`-typed. `APPLICATION_JSON` intentionally supports any JSON shape, so
+use explicit socket generics or controllers when strict application types are
+required:
+
+```ts
+type ApiData =
+  | { id: number }
+  | { id: number; name: string }
+  | { login: string; password: string }
+  | { token: string };
+
+const typedSocket = new RSocket<ApiData>("wss://api.example.com/rsocket", {
+  setup: {
+    mimetype: {
+      data: WellKnownMimeType.APPLICATION_JSON,
+      metadata: WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA
+    }
+  }
+});
+```
+
+A per-call codec override keeps its own payload type:
+
+```ts
+connection.fireAndForget<string>(
+  "ready",
+  route("status.update"),
+  { data: WellKnownMimeType.TEXT_PLAIN }
+);
+```
+
+The responder must already expect that data codec for the route. RSocket does
+not attach a separate data MIME declaration to every request frame.
+
+See [rsocket-frames-ts](https://github.com/CKATEPTb/rsocket-frames-ts) for the
+complete MIME, frame, payload, routing, composite metadata, and authentication
+codec API.
+
+## Metadata And Authentication
+
+### Routing
+
+Create protocol metadata with a MIME codec, not with untyped strings:
+
+```ts
+import { WellKnownMimeType } from "rsocket-frames-ts";
+
+const route = (name: string) =>
+  WellKnownMimeType.MESSAGE_RSOCKET_ROUTING.toMetadata([name]);
+
+connection.requestResponse({ id: 42 }, route("user.find"));
+```
+
+Use composite metadata when one request may contain more than one metadata
+type, such as routing plus authentication. A fully manual composite is also
+accepted:
+
+```ts
+import {
+  WellKnownAuthType,
+  WellKnownMimeType
+} from "rsocket-frames-ts";
+
+const authMime = WellKnownMimeType.MESSAGE_RSOCKET_AUTHENTICATION;
+const compositeMime = WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA;
+
+const metadata = compositeMime.toMetadata([
+  route("user.find"),
+  authMime.toMetadata(WellKnownAuthType.BEARER.auth("access-token"))
+]);
+
+connection.requestResponse({ id: 42 }, metadata);
+```
+
+### Persistent Metadata
+
+`metadataUpdate` changes client-side defaults merged into all later
+interactions. This is the simplest way to attach an access token:
+
+```ts
+const authMime = WellKnownMimeType.MESSAGE_RSOCKET_AUTHENTICATION;
+
+socket.metadataUpdate((metadata) => {
+  metadata.set(
+    authMime,
+    WellKnownAuthType.BEARER.auth("access-token")
+  );
+});
+```
+
+Use the RSocket simple authentication type when needed:
+
+```ts
+socket.metadataUpdate((metadata) => {
+  metadata.set(
+    authMime,
+    WellKnownAuthType.SIMPLE.auth({
+      username: "daniel",
+      password: "secret"
+    })
+  );
+});
+```
+
+Remove authentication without changing other defaults:
+
+```ts
+socket.metadataUpdate((metadata) => {
+  metadata.remove(authMime);
+});
+```
+
+Metadata is merged by MIME type:
+
+- Persistent authentication and a controller/request route are both retained.
+- Request metadata replaces only a persistent entry with the same MIME type.
+- A controller route therefore overrides a persistent route for that request.
+- Unrelated persistent metadata is never removed by a request override.
+
+The SETUP metadata MIME controls what can be stored. Composite metadata accepts
+any MIME-keyed entries. A direct routing MIME accepts only routing entries; a
+direct authentication MIME accepts only authentication entries. Unsupported
+updates throw immediately instead of creating an invalid wire payload.
 
 ### Metadata Push
 
-Push connection-level metadata (e.g. authentication).
+`metadataPush` sends an RSocket `METADATA_PUSH` frame to the server. It does not
+replace the persistent client defaults managed by `metadataUpdate`:
 
-```typescript
-socket.metadataPush(
-    WellKnownMimeType.MESSAGE_RSOCKET_AUTHENTICATION.toMetadata(
-        WellKnownAuthType.SIMPLE.auth({
-            username: "username@example.com",
-            password: "********************",
-        }),
-    ),
-).subscribe();
+```ts
+await connection
+  .metadataPush(
+    authMime.toMetadata(
+      WellKnownAuthType.BEARER.auth("refreshed-access-token")
+    )
+  )
+  .block();
 ```
 
-### Fire and Forget
+Server support for `METADATA_PUSH` is optional. Use `metadataUpdate` when the
+goal is only to attach metadata to subsequent client requests.
 
-Send a payload with no response expected.
+## Declarative Controllers
 
-```typescript
-socket.fireAndForget({
-    data:     { key: "value" },
-    metadata: ["example.fire.and.forget.route"],
-}).subscribe();
+Controllers provide endpoint-specific request and response types while keeping
+the direct interaction methods available. Declare a class, select its
+interaction model through `extends`, and assign a protected route.
+
+```ts
+import { RequestResponseController } from "rsocket-browser";
+
+interface SignInRequest {
+  login: string;
+  password: string;
+}
+
+interface TokenResponse {
+  token: string;
+}
+
+export default class SignInController extends RequestResponseController<
+  SignInRequest,
+  TokenResponse
+> {
+  protected readonly route = "account.sign-in";
+}
 ```
 
-### Request–Response
+`process` infers its arguments and return type from the controller:
 
-Send a request, receive exactly one response.
-
-```typescript
-socket.requestResponse({
-    data:     { key: "value" },
-    metadata: ["example.request.response.route"],
-})
-    .doOnNext(payload => {
-        console.log(payload.data);
-        console.log(payload.metadata);
-    })
-    .doOnError(error => console.error(error))
-    .subscribe();
+```ts
+const token = await connection
+  .process(SignInController, {
+    login: "login@example.com",
+    password: "password"
+  })
+  .map((response) => response.token)
+  .block();
 ```
 
-### Request–Stream
+The other interaction models follow the same declaration style:
 
-Send a single request, receive a back-pressure-controlled stream of responses.
+```ts
+import {
+  FireAndForgetController,
+  RequestChannelController,
+  RequestStreamController
+} from "rsocket-browser";
 
-```typescript
-socket.requestStream(
-    {
-        data:     { key: "value" },
-        metadata: ["example.request.stream.route"],
-    },
-    30, // ask the server to send up to 30 items into the buffer immediately
-).subscribe({
-    onSubscribe: sub => sub.request(5), // pull 5 items from the buffer to start
-    onNext:      payload => {
-        console.log(payload.data);
-        console.log(payload.metadata);
-    },
-    onError:    error => console.error(error),
-    onComplete: ()    => console.log("stream completed"),
+class DeactivateAccountController extends FireAndForgetController<{
+  reason: string;
+}> {
+  protected readonly route = "account.deactivate";
+}
+
+class OnlineController extends RequestStreamController<
+  { accountId: number },
+  { accountId: number; lastOnlineAt: number; online: boolean }
+> {
+  protected readonly route = "account.online";
+}
+
+class ChatController extends RequestChannelController<
+  { room: string; text: string },
+  { id: string; room: string; text: string }
+> {
+  protected readonly route = "chat.messages";
+}
+
+connection.process(DeactivateAccountController, { reason: "privacy" });
+connection.process(OnlineController, { accountId: 42 });
+connection.process(ChatController, [
+  { room: "general", text: "Hello" }
+]);
+```
+
+Class declarations are instantiated once per socket, which reuses encoded route
+metadata. Pass an instance when request options, logging, or instance state are
+needed:
+
+```ts
+const signIn = new SignInController({ timeout: 5_000 }).log({
+  payload: false
+});
+
+connection.process(signIn, {
+  login: "login@example.com",
+  password: "password"
 });
 ```
 
-### Request–Channel
+Override `data` or `response` only when the wire shape differs from the public
+controller type:
 
-A fully bidirectional stream — send a publisher of payloads, receive a stream of responses.
+```ts
+class FindUserController extends RequestResponseController<number, string> {
+  protected readonly route = "user.find";
 
-```typescript
-socket.requestChannel(
-    Flux.range(0, 100).map(value => ({
-        data:     { key: value },
-        metadata: ["example.request.channel.route"],
-    })),
-    30, // initial request-N to the responder
-).subscribe({
-    onSubscribe: sub => sub.request(5),
-    onNext:      payload => {
-        console.log(payload.data);
-        console.log(payload.metadata);
-    },
-    onError:    error => console.error(error),
-    onComplete: ()    => console.log("channel completed"),
+  protected override data(id: number) {
+    return { id };
+  }
+
+  protected override response(payload: { data?: unknown }) {
+    const user = payload.data as { name: string };
+    return user.name;
+  }
+}
+```
+
+Controller routes work with direct RSocket routing metadata or composite
+metadata. With composite metadata, a route is merged with persistent entries
+such as authentication.
+
+## Reconnect And Resume
+
+Automatic WebSocket reconnect is enabled by default. Unexpected disconnects,
+browser offline/online transitions, tab wakeups, and mobile sleep/wake cycles
+trigger a new connection attempt. Calling `disconnect()` stops that process.
+
+Without Resume, reconnect opens a fresh RSocket session with `SETUP`. Enable
+protocol Resume by specifying how long the backend retains resumable state:
+
+```ts
+const socket = new RSocket("wss://api.example.com/rsocket", {
+  setup: {
+    keepAlive: 20_000,
+    lifetime: 90_000,
+    mimetype: {
+      data: WellKnownMimeType.APPLICATION_JSON,
+      metadata: WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA
+    }
+  },
+  reconnect: {
+    resume: {
+      ttl: 5 * 60_000
+    }
+  }
 });
 ```
 
----
+The client creates and manages the Resume token and byte positions. While the
+TTL is valid, it waits for network/server availability and attempts `RESUME`.
+If the responder rejects Resume, or the TTL expires, the client automatically
+falls back to a fresh `SETUP` connection.
 
-## Cancellation
+Existing streams and channels survive only when protocol Resume succeeds. A
+fresh session cannot recover server-side stream state, so affected interactions
+fail and the application must create them again. The client does not guess at
+application-level replay or deduplication rules.
 
-Any subscription can be cancelled at any time. A `CANCEL` frame is sent to the server automatically.
+Use lifecycle events to update frontend connection state:
 
-```typescript
-const subscription = socket.requestStream({ /* ... */ }, 10).subscribe();
-
-// Cancel after 2 seconds.
-setTimeout(() => subscription.unsubscribe(), 2_000);
+```ts
+const socket = new RSocket("wss://api.example.com/rsocket", {
+  events: {
+    disconnect(event) {
+      showConnectionBanner(event.message);
+    },
+    reconnecting(event) {
+      showConnectionBanner(event.message);
+    },
+    resumeRejected(event) {
+      console.warn(event.message, event.error);
+    },
+    connected(event) {
+      hideConnectionBanner();
+      console.log(event.message);
+    }
+  }
+});
 ```
 
----
+Every event includes `type`, `status`, `message`, `connected`, `recovering`,
+`attempt`, and relevant error/retry fields.
 
-## Configuration reference
+Disable automatic reconnect explicitly when the application owns retry policy:
 
-| Option | Type | Description |
-|---|---|---|
-| `url` | `string` | WebSocket URL (`ws://` or `wss://`) |
-| `setup.keepAlive` | `number` | Milliseconds between KEEPALIVE probes |
-| `setup.lifetime` | `number` | Milliseconds before the connection is declared dead without a KEEPALIVE response |
-| `setup.mimetype.data` | `MimeType<P>` | MIME type used to encode/decode payload data |
-| `setup.mimetype.metadata` | `MimeType<M>` | MIME type used to encode/decode payload metadata |
-| `setup.payload` | `Payload<P, M>` | Optional payload to attach to the SETUP frame |
-| `logs.inbound` | `boolean` | Log inbound frames (default: `false`) |
-| `logs.outbound` | `boolean` | Log outbound frames (default: `false`) |
+```ts
+new RSocket("wss://api.example.com/rsocket", {
+  reconnect: false
+});
+```
 
----
+## Connection Lifecycle
 
-## License
+The state-specific surface prevents invalid lifecycle calls:
 
-LGPL-3.0-only — see [LICENSE.md](./LICENSE.md).
+```ts
+const socket = new RSocket("wss://api.example.com/rsocket");
+const connected = await socket.connect().block();
 
----
+if (connected) {
+  const disconnected = connected.disconnect(1000, "Signed out");
+  await disconnected.connect().block();
+}
+```
 
-## Authors
+- A disconnected socket exposes interactions, `metadataPush`, `metadataUpdate`,
+  `process`, and `connect`.
+- A connected socket exposes the same request API plus `disconnect`, but no
+  second `connect` method.
+- Requests subscribed before a connection is available wait for the current
+  connection attempt. Calling `connect()` explicitly during application startup
+  usually makes failure handling clearer.
 
-[CKATEPTb](https://github.com/CKATEPTb), [fakeivchenko](https://github.com/fakeivchenko)
+## Logging And Errors
 
-Feel free to open issues and submit pull requests to improve the library!
+Enable only the diagnostics needed for the current problem:
+
+```ts
+const socket = new RSocket("wss://api.example.com/rsocket", {
+  log: {
+    enabled: true,
+    frames: true,
+    lifecycle: true,
+    interactions: true,
+    payload: false
+  }
+});
+```
+
+Controller logging is local to one endpoint:
+
+```ts
+const signIn = new SignInController().log({
+  interactions: true,
+  payload: false
+});
+
+connection.process(signIn, {
+  login: "login@example.com",
+  password: "password"
+});
+```
+
+Payload logging is disabled by default because payloads may contain credentials
+or personal data.
+
+RSocket `ERROR` frames, timeouts, transport failures, invalid demand, and codec
+errors are propagated through Reactor error signals. `block()` rejects;
+streaming subscribers receive `onError`:
+
+```ts
+try {
+  await connection
+    .requestResponse({ id: 42 }, route("user.find"))
+    .block();
+} catch (error) {
+  console.error("request failed", error);
+}
+```
+
+## Server Compatibility
+
+The responder must expose an RSocket WebSocket endpoint and agree on the SETUP
+data and metadata MIME types. For Spring applications, composite metadata plus
+`message/x.rsocket.routing.v0` is the usual choice for `@MessageMapping`
+routes. The controller `route` field creates that standard routing metadata.
+
+Resume and `METADATA_PUSH` require server-side support. If Resume is rejected,
+the client reports `resumeRejected` and opens a fresh session. The package is a
+requester only; it does not expose a responder/server API or a TCP transport.
+
+Large RSocket payloads are fragmented and incoming fragments are reassembled by
+the client. Backpressure, cancellation, KEEPALIVE, stream IDs, protocol errors,
+and Resume positions are handled at the frame layer.
+
+## Public Exports
+
+The package root intentionally has one small runtime surface:
+
+```ts
+import {
+  RSocket,
+  FireAndForgetController,
+  RequestResponseController,
+  RequestStreamController,
+  RequestChannelController
+} from "rsocket-browser";
+```
+
+It also exports the `RSocketControllerRoute` and `RSocketPayloadDecoder` types.
+Frames, MIME types, metadata, and authentication codecs remain available from
+the automatically installed `rsocket-frames-ts` package. There is no default
+export and no secondary package entry point.
+
+## Development
+
+```bash
+npm test
+npm run build
+```
+
+`npm test` type-checks the public API and runs unit, protocol, transport, Java
+RSocket, and Spring Boot integration tests. `npm run build` creates the ESM
+bundle and declarations, rewrites internal aliases, and verifies the publishable
+package surface.
