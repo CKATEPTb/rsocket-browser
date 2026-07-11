@@ -632,19 +632,6 @@ Large RSocket payloads are fragmented and incoming fragments are reassembled by
 the client. Backpressure, cancellation, KEEPALIVE, stream IDs, protocol errors,
 and Resume positions are handled at the frame layer.
 
-## Common Issues
-
-- **A stream emits nothing:** request positive demand in `onSubscribe`, or
-  consume it with `for await ... of`.
-- **A route is not found:** verify the exact route and configure routing or
-  composite metadata in SETUP.
-- **Authentication and routing cannot coexist:** use
-  `MESSAGE_RSOCKET_COMPOSITE_METADATA` as the SETUP metadata MIME.
-- **JSON values are typed as `any`:** provide explicit `RSocket` generics or use
-  endpoint-specific controller generics.
-- **A stream fails after server restart:** the server lost resumable state;
-  recreate the interaction after the fresh connection is established.
-
 ## Public Exports
 
 The package root intentionally has one small runtime surface:
