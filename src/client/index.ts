@@ -910,7 +910,7 @@ export class BrowserRSocketClient implements StreamSession {
             this.lastReceivedAt = Date.now();
             if (this.activityListeners !== undefined) this.emitActivity("receive", frame);
             const dispatchStream = payloadStream !== undefined && this.activityListeners !== undefined &&
-                this.streams.get(streamId) !== payloadStream
+            this.streams.get(streamId) !== payloadStream
                 ? undefined
                 : payloadStream;
             this.handleFrame(frame, dispatchStream, streamId);

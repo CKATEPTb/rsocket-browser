@@ -8,9 +8,9 @@ import {defaultWebSocketFactory} from "@/transport/websocket/factory.js";
 import {openWebSocket, webSocketEventFlux, webSocketMessageBytes} from "@/transport/websocket/events.js";
 import {WS_CLOSED, WS_CLOSING, WS_OPEN} from "@/transport/websocket/constants.js";
 import {
-  type NormalizedWebSocketEndpoint,
-  normalizeWebSocketEndpoint,
-  validateWebSocketClose
+    type NormalizedWebSocketEndpoint,
+    normalizeWebSocketEndpoint,
+    validateWebSocketClose
 } from "@/transport/websocket/spec.js";
 
 /**

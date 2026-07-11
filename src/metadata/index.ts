@@ -7,11 +7,11 @@
  */
 import {Metadata, MimeType, WellKnownMimeType} from "rsocket-frames-ts";
 import {
-  canPrefetchChannelInput,
-  channelInputIterable,
-  isChannelInputAsyncIterable,
-  isChannelInputIterable,
-  markPrefetchableChannelInput
+    canPrefetchChannelInput,
+    channelInputIterable,
+    isChannelInputAsyncIterable,
+    isChannelInputIterable,
+    markPrefetchableChannelInput
 } from "@/channel/input.js";
 import {compositeMetadataEntries, encodeMetadataInput, metadata as encodeMetadataValue} from "@/payload/index.js";
 import type {RSocketChannelInput, RSocketPayload, RSocketPayloadInput} from "@/types/index.js";

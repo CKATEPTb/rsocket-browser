@@ -6,32 +6,32 @@
  * readonly `route` field with the server route name.
  */
 import {
-  controllerLogDefaults,
-  type NormalizedRSocketLogOptions,
-  normalizeLogOptions,
-  type RSocketLogInput
+    controllerLogDefaults,
+    type NormalizedRSocketLogOptions,
+    normalizeLogOptions,
+    type RSocketLogInput
 } from "@/logging/index.js";
 import {
-  routeChannelInputFactory,
-  routePayloadFactory,
-  type RSocketRouteChannelInputFactory,
-  type RSocketRoutePayloadFactory
+    routeChannelInputFactory,
+    routePayloadFactory,
+    type RSocketRouteChannelInputFactory,
+    type RSocketRoutePayloadFactory
 } from "@/controllers/route.js";
 import type {
-  FireAndForgetControllerDefinition,
-  RequestChannelControllerDefinition,
-  RequestResponseControllerDefinition,
-  RequestStreamControllerDefinition,
-  RSocketControllerKind,
-  RSocketControllerRoute,
-  RSocketPayloadDecoder
+    FireAndForgetControllerDefinition,
+    RequestChannelControllerDefinition,
+    RequestResponseControllerDefinition,
+    RequestStreamControllerDefinition,
+    RSocketControllerKind,
+    RSocketControllerRoute,
+    RSocketPayloadDecoder
 } from "@/controllers/types.js";
 import type {
-  RSocketChannelInput,
-  RSocketPayloadFrame,
-  RSocketPayloadInput,
-  RSocketRequestOptions,
-  RSocketStreamRequestOptions
+    RSocketChannelInput,
+    RSocketPayloadFrame,
+    RSocketPayloadInput,
+    RSocketRequestOptions,
+    RSocketStreamRequestOptions
 } from "@/types/index.js";
 
 /** UTF-8 encoder used once per cached controller route validation. */

@@ -4,11 +4,11 @@
 import {Metadata, MimeType} from "rsocket-frames-ts";
 import type {RSocketConnectionEventHandlers, RSocketReconnectOptionInput} from "@/reconnect/index.js";
 import type {
-  RSocketClientOptions,
-  RSocketPayloadInput,
-  RSocketRequestOptions,
-  RSocketWebSocket,
-  RSocketWebSocketFactory
+    RSocketClientOptions,
+    RSocketPayloadInput,
+    RSocketRequestOptions,
+    RSocketWebSocket,
+    RSocketWebSocketFactory
 } from "@/types/index.js";
 import type {RSocketLogInput} from "@/logging/index.js";
 
