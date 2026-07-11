@@ -90,10 +90,7 @@ const socket = new RSocket("wss://api.example.com/rsocket", {
 const connected = (await socket.connect().block())!;
 
 const payload = await connected
-  .requestResponse({
-    data: { id: 42 },
-    metadata: route("user.find")
-  })
+  .requestResponse({ id: 42 }, route("user.find"))
   .block();
 
 const user = payload?.data as { id: number; name: string };
@@ -106,6 +103,63 @@ The important parts:
 - `await socket.connect().block()` opens WebSocket, sends RSocket `SETUP`, and returns a connected state surface.
 - `requestResponse(...)`, `fireAndForget(...)`, `requestStream(...)`, and `requestChannel(...)` send direct RSocket interactions.
 - `.block()` is a convenient way to await the `Mono` in async code.
+
+### MIME-Driven Types
+
+`RSocket` carries the generic value types declared by `setup.mimetype` into the
+connected facade and every direct interaction. A codec such as `TEXT_PLAIN`
+therefore makes direct data arguments and decoded response data `string`:
+
+```ts
+const textSocket = new RSocket("wss://api.example.com/rsocket", {
+  setup: {
+    mimetype: {
+      data: WellKnownMimeType.TEXT_PLAIN,
+      metadata: WellKnownMimeType.MESSAGE_RSOCKET_ROUTING
+    }
+  }
+});
+
+textSocket.fireAndForget("hello", ["messages.accept"]);
+// textSocket.fireAndForget(42); // TypeScript error: data must be string
+```
+
+The registry declares `APPLICATION_JSON` as `MimeType<any>` because JSON has no
+single application schema. Specify the socket generic when your application has
+one shared JSON contract; route-specific controller classes keep using their own
+request and response generics:
+
+```ts
+import type { Metadata } from "rsocket-frames-ts";
+
+type ApiData = { id: number };
+type CompositeMetadata = Metadata<any>[];
+
+const typedSocket = new RSocket<ApiData, CompositeMetadata>(
+  "wss://api.example.com/rsocket",
+  {
+    setup: {
+      mimetype: {
+        data: WellKnownMimeType.APPLICATION_JSON,
+        metadata: WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA
+      }
+    }
+  }
+);
+
+typedSocket.requestResponse({ id: 1 }, route("user.find"));
+```
+
+An interaction-level MIME override changes the expected argument type for that
+call only:
+
+```ts
+socket.fireAndForget(
+  "plain text",
+  undefined,
+  { data: WellKnownMimeType.TEXT_PLAIN }
+);
+```
 
 ## The Mental Model
 
@@ -122,18 +176,21 @@ Use it for:
 Example:
 
 ```ts
-const payload = await socket.requestResponse({ data: { id: 1 } }).block();
+const payload = await socket.requestResponse({ id: 1 }).block();
 ```
 
-Add a per-request timeout when the UI should stop waiting for a response. When
-the timeout expires, the client fails the `Mono` and sends `CANCEL` for that
-stream.
+Direct interactions use the same three positional arguments:
 
 ```ts
-await socket
-  .requestResponse({ data: { id: 1 } }, { timeout: 5_000 })
-  .block();
+socket.fireAndForget(data, metadata, mimetype);
+socket.requestResponse(data, metadata, mimetype);
+socket.requestStream(data, metadata, mimetype);
+socket.requestChannel(data, metadata, mimetype);
 ```
+
+`data` and `metadata` are optional. The third argument can override the two
+SETUP codecs for one interaction with `{ data: MimeType, metadata: MimeType }`.
+There is no payload envelope or mixed request-options object in this API.
 
 ### Flux
 
@@ -149,7 +206,7 @@ demand with `subscription.request(n)`. That demand becomes RSocket `REQUEST_N`.
 This is the core backpressure idea.
 
 ```ts
-socket.requestStream({ data: { limit: 100 } }).subscribe({
+socket.requestStream({ limit: 100 }).subscribe({
   onSubscribe(subscription) {
     subscription.request(10);
   },
@@ -245,10 +302,7 @@ const route = (name: string) =>
   WellKnownMimeType.MESSAGE_RSOCKET_ROUTING.toMetadata([name]);
 
 const payload = await socket
-  .requestResponse({
-    data: { id: 1 },
-    metadata: route("user.find")
-  })
+  .requestResponse({ id: 1 }, route("user.find"))
   .block();
 ```
 
@@ -283,10 +337,7 @@ const metadata =
     TENANT.toMetadata(utf8.encode("acme"))
   ]);
 
-const payload = await socket.requestResponse({
-  data: { id: 1 },
-  metadata
-}).block();
+const payload = await socket.requestResponse({ id: 1 }, metadata).block();
 ```
 
 Use `simpleAuthentication` instead of `bearerAuthentication` when the responder
@@ -391,10 +442,10 @@ Use it for telemetry, UI events, notifications, or commands where the server
 does not return a value.
 
 ```ts
-await socket.fireAndForget({
-  data: { page: "dashboard" },
-  metadata: route("analytics.pageOpened")
-}).block();
+await socket.fireAndForget(
+  { page: "dashboard" },
+  route("analytics.pageOpened")
+).block();
 ```
 
 The returned `Mono<void>` completes after the frame is written locally.
@@ -409,10 +460,10 @@ type User = {
   name: string;
 };
 
-const payload = await socket.requestResponse({
-  data: { id: 42 },
-  metadata: route("user.find")
-}).block();
+const payload = await socket.requestResponse(
+  { id: 42 },
+  route("user.find")
+).block();
 
 const user = payload.data as User;
 console.log(user.name);
@@ -431,10 +482,10 @@ The response object includes:
 Request-stream sends one request and receives many responses.
 
 ```ts
-const stream = socket.requestStream({
-  data: { category: "news" },
-  metadata: route("articles.byCategory")
-});
+const stream = socket.requestStream(
+  { category: "news" },
+  route("articles.byCategory")
+);
 
 stream.subscribe({
   onSubscribe(subscription) {
@@ -458,7 +509,7 @@ more `REQUEST_N` frames.
 You can also consume streams with async iteration:
 
 ```ts
-for await (const payload of socket.requestStream({ data: { limit: 10 } })) {
+for await (const payload of socket.requestStream({ limit: 10 })) {
   console.log(payload.data);
 }
 ```
@@ -473,7 +524,10 @@ server sends a stream of payloads back.
 Use sink style when your UI pushes values over time.
 
 ```ts
-const channel = socket.requestChannel();
+const channel = socket.requestChannel(
+  undefined,
+  route("chat.messages")
+);
 
 channel.subscribe({
   onSubscribe(subscription) {
@@ -490,15 +544,8 @@ channel.subscribe({
   }
 });
 
-channel.next({
-  metadata: route("chat.messages")
-});
-
-channel.next({
-  data: { room: "general", text: "hello" }
-});
-
-channel.sink.next({ data: { room: "general", text: "second message" } });
+channel.next({ room: "general", text: "hello" });
+channel.sink.next({ room: "general", text: "second message" });
 channel.complete();
 ```
 
@@ -512,16 +559,11 @@ or Reactor publisher.
 
 ```ts
 async function* messages() {
-  yield { data: { room: "general", text: "hello" } };
-  yield { data: { room: "general", text: "still here" } };
+  yield { room: "general", text: "hello" };
+  yield { room: "general", text: "still here" };
 }
 
-async function* routedMessages() {
-  yield { metadata: route("chat.messages") };
-  yield* messages();
-}
-
-socket.requestChannel(routedMessages()).subscribe({
+socket.requestChannel(messages(), route("chat.messages")).subscribe({
   onSubscribe(subscription) {
     subscription.request(32);
   },
@@ -619,6 +661,19 @@ const token = await socket
   .block();
 ```
 
+An explicit instance can carry low-level request settings without adding an
+options overload to the direct interaction methods. For example, a timed
+request-response fails its `Mono` and sends `CANCEL` after five seconds:
+
+```ts
+const timedController = new ChangePasswordController({ timeout: 5_000 });
+
+await socket.process(timedController, {
+  currentPassword: "old-password",
+  newPassword: "new-password"
+}).block();
+```
+
 TypeScript knows that `ChangePasswordController` expects
 `ChangePasswordRequest` and returns `Mono<TokenResponse>`.
 
@@ -711,8 +766,8 @@ Usage:
 
 ```ts
 async function* messages() {
-  yield { data: { text: "hello" } };
-  yield { data: { text: "how are you?" } };
+  yield { text: "hello" };
+  yield { text: "how are you?" };
 }
 
 socket.process(ChatController, messages()).subscribe({
@@ -1007,12 +1062,12 @@ The client throws library-specific errors for common failure categories:
 - `RSocketFrameSizeError`: a frame exceeds the client frame-size limit.
 
 These classes are intentionally not exported as separate root exports. The root
-runtime API stays focused on `RSocket` plus declarative controller helpers. In
+runtime API stays focused on `RSocket` plus abstract controller classes. In
 application code, you can usually handle them as normal `Error` values.
 
 ```ts
 try {
-  await socket.requestResponse({ data: { id: 1 } }).block();
+  await socket.requestResponse({ id: 1 }).block();
 } catch (error) {
   console.error("RSocket request failed", error);
 }
@@ -1062,10 +1117,7 @@ const route = WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA.toMetadata([
 ]);
 
 const payload = await socket
-  .requestResponse({
-    data: { id: 42 },
-    metadata: route
-  })
+  .requestResponse({ id: 42 }, route)
   .block();
 
 const user = payload?.data as User;
@@ -1139,10 +1191,7 @@ const metadata =
     bearerAuthentication
   ]);
 
-const payload = await socket.requestResponse({
-  data: { id: 42 },
-  metadata
-}).block();
+const payload = await socket.requestResponse({ id: 42 }, metadata).block();
 ```
 
 To attach the same credentials to every later request, store the authentication
@@ -1267,10 +1316,7 @@ const metadata = WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA.toMetadata
 ]);
 
 await socket
-  .requestResponse({
-    data: requestBody,
-    metadata
-  })
+  .requestResponse(requestBody, metadata)
   .block();
 ```
 
