@@ -89,6 +89,38 @@ export function canPrefetchChannelInput(input: unknown): boolean {
 }
 
 /**
+ * Prepends one initial payload while preserving the source's cheapest iteration path.
+ */
+export function prependChannelPayload<D, M>(
+  payload: RSocketPayloadInput<D, M>,
+  input: RSocketChannelInput<D, M>
+): RSocketChannelInput<D, M> {
+  if (!isChannelInputAsyncIterable(input) && isChannelInputIterable<RSocketPayloadInput<D, M>>(input)) {
+    return prependChannelPayloadSync(payload, input);
+  }
+  const prefixed = prependChannelPayloadAsync(payload, input);
+  return canPrefetchChannelInput(input) ? markPrefetchableChannelInput(prefixed) : prefixed;
+}
+
+/** Prepends one payload to a synchronous channel input. */
+function* prependChannelPayloadSync<D, M>(
+  payload: RSocketPayloadInput<D, M>,
+  input: Iterable<RSocketPayloadInput<D, M>>
+): Iterable<RSocketPayloadInput<D, M>> {
+  yield payload;
+  yield* input;
+}
+
+/** Prepends one payload to an asynchronous or publisher-backed channel input. */
+async function* prependChannelPayloadAsync<D, M>(
+  payload: RSocketPayloadInput<D, M>,
+  input: RSocketChannelInput<D, M>
+): AsyncIterable<RSocketPayloadInput<D, M>> {
+  yield payload;
+  for await (const item of channelInputIterable(input)) yield item;
+}
+
+/**
  * Wraps a synchronous iterator in the async iterator contract.
  */
 function iterableAsAsync<T>(input: Iterable<T>): AsyncIterable<T> {

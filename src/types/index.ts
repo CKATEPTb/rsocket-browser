@@ -150,7 +150,7 @@ export interface RSocketRequestOptions {
 export type RSocketStreamRequestOptions = RSocketRequestOptions;
 
 /**
- * User-friendly payload envelope accepted by request methods.
+ * Internal payload envelope used by codecs, controllers, and channel items.
  */
 export interface RSocketPayload<D = unknown, M = unknown> {
   /** Application data value. */
@@ -164,7 +164,7 @@ export interface RSocketPayload<D = unknown, M = unknown> {
 }
 
 /**
- * Any payload form accepted by request methods.
+ * Any payload form accepted by low-level interactions and channel publishers.
  */
 export type RSocketPayloadInput<D = unknown, M = unknown> =
   | RSocketPayload<D, M>

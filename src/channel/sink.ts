@@ -17,7 +17,9 @@ import type {
 /**
  * Factory used by sink-style request-channel helpers to create response Fluxes.
  */
-type ChannelResponseFactory<D, M> = (payloads: RSocketChannelInput<D, M>) => RSocketFlux;
+type ChannelResponseFactory<D, M> = (
+  payloads: RSocketChannelInput<D, M>
+) => RSocketFlux<RSocketPayloadFrame<D, M>>;
 
 /**
  * Minimal sink operations used by the non-replayable channel helper.
@@ -34,9 +36,9 @@ interface UnicastChannelSink<D, M> {
 /**
  * Imperative request-channel helper returned by `socket.requestChannel()`.
  */
-export class RSocketChannel<D = unknown, M = unknown> implements AsyncIterable<RSocketPayloadFrame> {
+export class RSocketChannel<D = unknown, M = unknown> implements AsyncIterable<RSocketPayloadFrame<D, M>> {
   /** Flux of response payloads produced by the responder side of the channel. */
-  readonly responses: RSocketFlux;
+  readonly responses: RSocketFlux<RSocketPayloadFrame<D, M>>;
   /** Reactor-style sink facade for pushing outbound channel payloads. */
   readonly sink: {
     next: (payload: RSocketPayloadInput<D, M>) => RSocketChannel<D, M>;
@@ -81,15 +83,15 @@ export class RSocketChannel<D = unknown, M = unknown> implements AsyncIterable<R
   /**
    * Returns the response `Flux` for advanced Reactor-style composition.
    */
-  asFlux(): RSocketFlux {
+  asFlux(): RSocketFlux<RSocketPayloadFrame<D, M>> {
     return this.responses;
   }
 
   /** Subscribes to channel responses with a full Reactor subscriber. */
-  subscribe(subscriber: Subscriber<RSocketPayloadFrame>): void;
+  subscribe(subscriber: Subscriber<RSocketPayloadFrame<D, M>>): void;
   /** Subscribes to channel responses with callback functions. */
   subscribe(
-    onNext?: (value: RSocketPayloadFrame) => void,
+    onNext?: (value: RSocketPayloadFrame<D, M>) => void,
     onError?: (error: unknown) => void,
     onComplete?: () => void
   ): Disposable;
@@ -97,7 +99,7 @@ export class RSocketChannel<D = unknown, M = unknown> implements AsyncIterable<R
    * Subscribes to responder payloads emitted by the request channel.
    */
   subscribe(
-    subscriberOrNext?: Subscriber<RSocketPayloadFrame> | ((value: RSocketPayloadFrame) => void),
+    subscriberOrNext?: Subscriber<RSocketPayloadFrame<D, M>> | ((value: RSocketPayloadFrame<D, M>) => void),
     onError?: (error: unknown) => void,
     onComplete?: () => void
   ): Disposable | void {
@@ -107,7 +109,7 @@ export class RSocketChannel<D = unknown, M = unknown> implements AsyncIterable<R
   /**
    * Allows `for await ... of` consumption of responder channel payloads.
    */
-  [Symbol.asyncIterator](): AsyncIterator<RSocketPayloadFrame> {
+  [Symbol.asyncIterator](): AsyncIterator<RSocketPayloadFrame<D, M>> {
     return this.responses[Symbol.asyncIterator]();
   }
 

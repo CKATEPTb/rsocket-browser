@@ -1,6 +1,5 @@
 /**
- * Type contracts for declarative RSocket controllers used by the matching
- * `RSocket` request method.
+ * Type contracts for declarative controllers executed by `RSocket.process(...)`.
  */
 import type { Flux, Mono } from "reactor-core-ts";
 import type { RSocketFlux } from "@/stream/index.js";
@@ -26,7 +25,7 @@ export type RSocketControllerKind =
   | "requestChannel";
 
 /**
- * RSocket routing metadata accepted by controller factories.
+ * RSocket routing metadata accepted by class-based controllers.
  *
  * A string creates one `message/x.rsocket.routing.v0` route entry, while an
  * array creates a route from multiple path segments.
@@ -37,11 +36,6 @@ export type RSocketControllerRoute = string | readonly string[];
  * Builds a full RSocket payload from strongly typed controller arguments.
  */
 export type RSocketPayloadFactory<Args extends readonly unknown[]> = (...args: Args) => RSocketPayloadInput<any, any>;
-
-/**
- * Builds only the data part for route-based controller factories.
- */
-export type RSocketDataFactory<Args extends readonly unknown[]> = (...args: Args) => unknown;
 
 /**
  * Builds the outbound publisher used by request-channel controllers.
@@ -57,7 +51,7 @@ export type RSocketPayloadDecoder<Result> = (payload: RSocketPayloadFrame) => Re
  * Declarative fire-and-forget endpoint.
  *
  * The controller produces one request payload and returns `Mono<void>` from
- * `RSocket.fireAndForget(...)` after the frame is written to the WebSocket.
+ * `RSocket.process(...)` after the frame is written to the WebSocket.
  */
 export interface FireAndForgetControllerDefinition<Args extends readonly unknown[]> {
   /** Identifies the RSocket interaction model. */

@@ -10,15 +10,14 @@ import {
   interactionLogEvent,
   type NormalizedRSocketLogOptions
 } from "@/logging/index.js";
-import { isIdentityDecoder } from "@/controllers/identity.js";
+import type { AnyClassController } from "@/controllers/classes.js";
 import type {
   ControllerArgs,
   ControllerReturn,
-  AnyRSocketController,
   RSocketControllerConnection,
   RSocketPayloadDecoder
 } from "@/controllers/types.js";
-import type { RSocketPayloadFrame } from "@/types/index.js";
+import type { RSocketChannelInput, RSocketPayloadFrame } from "@/types/index.js";
 
 /**
  * Executes a declarative controller against an RSocket connection.
@@ -27,7 +26,7 @@ import type { RSocketPayloadFrame } from "@/types/index.js";
  * `Mono<void>`, request-response returns `Mono<Result>`, and streaming
  * interactions return `Flux<Result>`.
  */
-export function processController<C extends AnyRSocketController>(
+export function processController<C extends AnyClassController>(
   connection: RSocketControllerConnection,
   controller: C,
   args: ControllerArgs<C>
@@ -61,7 +60,7 @@ export function processController<C extends AnyRSocketController>(
       ) as ControllerReturn<C>;
     }
     case "requestChannel": {
-      const input = controller.input(...args);
+      const input = controller.input(args[0] as RSocketChannelInput<any, any>);
       return logFlux(
         decodeFlux(connection.requestChannel(input, controller.options), controller.decode),
         controller.logging,
@@ -73,27 +72,23 @@ export function processController<C extends AnyRSocketController>(
 }
 
 /**
- * Applies a controller decoder unless the factory declared the raw payload identity decoder.
+ * Applies a request-response controller decoder.
  */
 function decodeMono<Result>(
   source: Mono<RSocketPayloadFrame>,
   decode: RSocketPayloadDecoder<Result>
 ): Mono<Result> {
-  return isIdentityDecoder(decode as RSocketPayloadDecoder<unknown>)
-    ? source as unknown as Mono<Result>
-    : source.map(decode);
+  return source.map(decode);
 }
 
 /**
- * Applies a streaming controller decoder unless it would only add an identity map operator.
+ * Applies a streaming controller decoder.
  */
 function decodeFlux<Result>(
   source: Flux<RSocketPayloadFrame>,
   decode: RSocketPayloadDecoder<Result>
 ): Flux<Result> {
-  return isIdentityDecoder(decode as RSocketPayloadDecoder<unknown>)
-    ? source as unknown as Flux<Result>
-    : source.map(decode);
+  return source.map(decode);
 }
 
 /**
@@ -102,7 +97,7 @@ function decodeFlux<Result>(
 function logMono<T>(
   source: Mono<T>,
   logging: NormalizedRSocketLogOptions | undefined,
-  interaction: AnyRSocketController["kind"],
+  interaction: AnyClassController["kind"],
   payload: unknown
 ): Mono<T> {
   if (logging === undefined || !logging.enabled || !logging.interactions) return source;
@@ -122,7 +117,7 @@ function logMono<T>(
 function logFlux<T>(
   source: Flux<T>,
   logging: NormalizedRSocketLogOptions | undefined,
-  interaction: AnyRSocketController["kind"],
+  interaction: AnyClassController["kind"],
   payload: unknown
 ): Flux<T> {
   if (logging === undefined || !logging.enabled || !logging.interactions) return source;
@@ -138,7 +133,7 @@ function logFlux<T>(
  */
 function logInteraction(
   logging: NormalizedRSocketLogOptions | undefined,
-  interaction: AnyRSocketController["kind"],
+  interaction: AnyClassController["kind"],
   stage: "send" | "receive" | "complete" | "error",
   payload?: unknown,
   value?: unknown,

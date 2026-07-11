@@ -46,7 +46,7 @@ export interface RSocketSetupOptions<D = unknown, M = unknown> {
   /** Maximum silence interval before the connection is considered dead. */
   readonly lifetime?: number;
   /** MIME codecs used for request data and metadata. */
-  readonly mimetype?: RSocketSetupMimeTypes<D, M>;
+  readonly mimetype?: RSocketMimeTypes<D, M>;
   /** Optional payload sent in the SETUP frame. */
   readonly payload?: RSocketPayloadInput<D, M>;
   /** Optional WebSocket-like transport factory. Defaults to browser `WebSocket`. */
@@ -54,9 +54,9 @@ export interface RSocketSetupOptions<D = unknown, M = unknown> {
 }
 
 /**
- * Data and metadata MIME codecs used by SETUP and default request encoding.
+ * Data and metadata MIME codecs used by SETUP or one positional interaction.
  */
-export interface RSocketSetupMimeTypes<D = unknown, M = unknown> {
+export interface RSocketMimeTypes<D = unknown, M = unknown> {
   /** Metadata MIME codec or MIME string. */
   readonly metadata?: MimeTypeInput<M>;
   /** Data MIME codec or MIME string. */
@@ -74,11 +74,11 @@ export interface RSocketConstructorOptions<D = unknown, M = unknown> extends RSo
 /**
  * URL and options pair produced by constructor overload normalization.
  */
-export interface ResolvedRSocketConstructorOptions {
+export interface ResolvedRSocketConstructorOptions<D = unknown, M = unknown> {
   /** WebSocket endpoint URL for the requester connection. */
   readonly url: string | URL;
   /** Constructor options without the URL field. */
-  readonly options: RSocketOptions;
+  readonly options: RSocketOptions<D, M>;
 }
 
 /**
@@ -116,7 +116,7 @@ interface LegacyRSocketOptions<D = unknown, M = unknown> {
  * Older nested SETUP aliases still read at runtime without polluting constructor autocomplete.
  */
 interface LegacyRSocketSetupOptions<D = unknown, M = unknown> {
-  readonly mimeType?: RSocketSetupMimeTypes<D, M>;
+  readonly mimeType?: RSocketMimeTypes<D, M>;
   readonly metadata?: M | Metadata<M>;
   readonly majorVersion?: number;
   readonly minorVersion?: number;
@@ -126,12 +126,16 @@ interface LegacyRSocketSetupOptions<D = unknown, M = unknown> {
 /**
  * Converts public facade options into low-level client options.
  */
-export function toClientOptions(url: string | URL, options: RSocketOptions, resumeToken?: string): RSocketClientOptions {
-  const legacy = options as RSocketOptions & LegacyRSocketOptions;
-  const setupInput = options.setup as (RSocketSetupOptions & LegacyRSocketSetupOptions) | undefined;
+export function toClientOptions<D, M>(
+  url: string | URL,
+  options: RSocketOptions<D, M>,
+  resumeToken?: string
+): RSocketClientOptions<D, M> {
+  const legacy = options as RSocketOptions<D, M> & LegacyRSocketOptions<D, M>;
+  const setupInput = options.setup as (RSocketSetupOptions<D, M> & LegacyRSocketSetupOptions<D, M>) | undefined;
   const mimetype = setupInput?.mimetype ?? setupInput?.mimeType;
-  const setup: NonNullable<RSocketClientOptions["setup"]> = {};
-  const clientOptions: RSocketClientOptions = {
+  const setup: NonNullable<RSocketClientOptions<D, M>["setup"]> = {};
+  const clientOptions: RSocketClientOptions<D, M> = {
     url,
     setup
   };
@@ -173,38 +177,25 @@ export function normalizeRequestOptions(options: RSocketRequestOptions): RSocket
 }
 
 /**
- * Detects the no-payload request-channel overload.
+ * Converts the positional interaction MIME argument into low-level request options.
  */
-export function isRequestOptions(value: unknown): value is RSocketRequestOptions {
-  if (!isPlainObject(value)) return false;
-  if ("data" in value || "metadata" in value) return false;
-  const source = value as {
-    readonly subscribe?: unknown;
-    readonly then?: unknown;
-    readonly [Symbol.iterator]?: unknown;
-    readonly [Symbol.asyncIterator]?: unknown;
-  };
-  if (
-    typeof source.subscribe === "function" ||
-    typeof source.then === "function" ||
-    typeof source[Symbol.iterator] === "function" ||
-    typeof source[Symbol.asyncIterator] === "function"
-  ) {
-    return false;
-  }
-  return !hasOwnEnumerableKey(value) ||
-    "dataMimeType" in value ||
-    "metadataMimeType" in value ||
-    "timeout" in value;
+export function requestOptionsFromMimeTypes<D, M>(
+  mimetype: RSocketMimeTypes<D, M> | undefined
+): RSocketRequestOptions {
+  if (mimetype === undefined) return EMPTY_REQUEST_OPTIONS;
+  const options: RSocketRequestOptions = {};
+  assignOptional(options, "dataMimeType", resolveMimeType(mimetype.data));
+  assignOptional(options, "metadataMimeType", resolveMimeType(mimetype.metadata));
+  return options;
 }
 
 /**
  * Normalizes both supported constructor forms into a URL plus options object.
  */
-export function resolveConstructorOptions(
-  urlOrOptions: string | URL | RSocketConstructorOptions,
-  options: RSocketOptions
-): ResolvedRSocketConstructorOptions {
+export function resolveConstructorOptions<D, M>(
+  urlOrOptions: string | URL | RSocketConstructorOptions<D, M>,
+  options: RSocketOptions<D, M>
+): ResolvedRSocketConstructorOptions<D, M> {
   if (typeof urlOrOptions === "string" || urlOrOptions instanceof URL) {
     return { url: urlOrOptions, options };
   }
@@ -219,28 +210,6 @@ function resolveMimeType<T>(mimeType: MimeTypeInput<T> | undefined): MimeType<T>
   if (mimeType === undefined) return undefined;
   if (typeof mimeType === "string") return MimeType.valueOf<T>(mimeType);
   return mimeType;
-}
-
-/** Cached intrinsic used by request-options scans. */
-const HAS_OWN_PROPERTY = Object.prototype.hasOwnProperty;
-
-/**
- * Detects plain option bags without confusing publishers for options.
- */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-/**
- * Checks whether an options candidate has own enumerable keys without allocating `Object.keys(...)`.
- */
-function hasOwnEnumerableKey(value: Record<string, unknown>): boolean {
-  for (const key in value) {
-    if (HAS_OWN_PROPERTY.call(value, key)) return true;
-  }
-  return false;
 }
 
 /**

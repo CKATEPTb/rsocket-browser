@@ -1,13 +1,7 @@
 /**
  * Route metadata helpers for route-based declarative controllers.
  */
-import {
-  canPrefetchChannelInput,
-  channelInputIterable,
-  isChannelInputAsyncIterable,
-  isChannelInputIterable,
-  markPrefetchableChannelInput
-} from "@/channel/input.js";
+import { prependChannelPayload } from "@/channel/input.js";
 import { route } from "@/payload/index.js";
 import type { RSocketChannelInput, RSocketPayloadInput } from "@/types/index.js";
 import type { RSocketControllerRoute } from "@/controllers/types.js";
@@ -50,7 +44,7 @@ export function routePayloadFactory(controllerRoute: RSocketControllerRoute): RS
  */
 export function routeChannelInputFactory(controllerRoute: RSocketControllerRoute): RSocketRouteChannelInputFactory {
   const routedPayload = routePayloadFactory(controllerRoute);
-  return (input) => prependRoutePayload(routedPayload, input);
+  return (input) => prependChannelPayload(routedPayload(), input);
 }
 
 /**
@@ -68,42 +62,4 @@ export function routeChannelInput(
   input: RSocketChannelInput<any, any>
 ): RSocketChannelInput {
   return routeChannelInputFactory(controllerRoute)(input);
-}
-
-/**
- * Prepends a route-only payload while preserving synchronous iterables on the fast path.
- */
-function prependRoutePayload(
-  routedPayload: RSocketRoutePayloadFactory,
-  input: RSocketChannelInput<any, any>
-): RSocketChannelInput {
-  if (!isChannelInputAsyncIterable(input) && isChannelInputIterable<RSocketPayloadInput<any, any>>(input)) {
-    return prependRoutePayloadSync(routedPayload, input);
-  }
-  const routed = prependRoutePayloadAsync(routedPayload, input);
-  return canPrefetchChannelInput(input) ? markPrefetchableChannelInput(routed) : routed;
-}
-
-/**
- * Synchronous route prepend used for arrays and other plain iterables.
- */
-function* prependRoutePayloadSync(
-  routedPayload: RSocketRoutePayloadFactory,
-  input: Iterable<RSocketPayloadInput<any, any>>
-): Iterable<RSocketPayloadInput<any, any>> {
-  yield routedPayload();
-  yield* input;
-}
-
-/**
- * Async route prepend used for publishers, promises, and async iterables.
- */
-async function* prependRoutePayloadAsync(
-  routedPayload: RSocketRoutePayloadFactory,
-  input: RSocketChannelInput<any, any>
-): AsyncIterable<RSocketPayloadInput<any, any>> {
-  yield routedPayload();
-  for await (const payload of channelInputIterable(input)) {
-    yield payload;
-  }
 }

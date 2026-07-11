@@ -33,13 +33,9 @@ assert.deepStrictEqual(
     "RSocket",
     "RequestChannelController",
     "RequestResponseController",
-    "RequestStreamController",
-    "fireAndForgetController",
-    "requestChannelController",
-    "requestResponseController",
-    "requestStreamController"
+    "RequestStreamController"
   ].sort(),
-  "runtime root exports must stay limited to RSocket and controller helpers"
+  "runtime root exports must stay limited to RSocket and abstract controller classes"
 );
 
 const distSourceFiles = sourceFiles("dist");

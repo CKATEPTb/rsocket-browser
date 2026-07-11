@@ -15,8 +15,10 @@ import {
   FrameErrorCode,
   Metadata,
   WellKnownMimeType,
-  type MimeType
+  type MimeType,
+  type Payload
 } from "rsocket-frames-ts";
+import { prependChannelPayload } from "@/channel/input.js";
 import { RSocketChannel } from "@/channel/sink.js";
 import { BrowserRSocketClient } from "@/client/index.js";
 import {
@@ -24,14 +26,10 @@ import {
   type NormalizedClientOptions
 } from "@/client/options.js";
 import { processController } from "@/controllers/index.js";
+import type { AnyClassController } from "@/controllers/classes.js";
 import type {
-  AnyRSocketController,
   ControllerArgs,
   ControllerReturn,
-  FireAndForgetControllerDefinition,
-  RequestChannelControllerDefinition,
-  RequestResponseControllerDefinition,
-  RequestStreamControllerDefinition,
   RSocketControllerConnection
 } from "@/controllers/index.js";
 import {
@@ -90,20 +88,16 @@ import { RSocketConnectionError } from "@/errors/index.js";
 import { directRSocketFluxSubscription, RSocketFlux } from "@/stream/index.js";
 import {
   EMPTY_REQUEST_OPTIONS,
-  isRequestOptions,
   normalizeRequestOptions,
+  requestOptionsFromMimeTypes,
   resolveConstructorOptions,
   toClientOptions,
   type RSocketConstructorOptions,
-  type RSocketOptions
+  type RSocketOptions,
+  type RSocketMimeTypes
 } from "@/rsocket/options.js";
 import {
-  controllerArgs,
   controllerInstance,
-  isControllerInput,
-  type RequestChannelResult,
-  type RequestResponseResult,
-  type RequestStreamResult,
   type RSocketControllerInstanceCache,
   type RSocketControllerInput
 } from "@/rsocket/controllers.js";
@@ -119,10 +113,24 @@ const COMPOSITE_METADATA_REQUEST_OPTIONS: RSocketRequestOptions = Object.freeze(
   metadataMimeType: WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA
 });
 
+/** Data accepted by one positional interaction call. */
+type RSocketDataArgument<D> = D | Payload<D>;
+
+/** Metadata accepted by one positional interaction call. */
+type RSocketMetadataArgument<M> = M | Metadata<any>;
+
+/** Return type selected by the optional request-channel source argument. */
+type RSocketChannelReturn<D, M, Input> = Input extends undefined
+  ? RSocketChannel<D, M>
+  : RSocketFlux<RSocketPayloadFrame<D, M>>;
+
+/** Shared envelope used when an interaction intentionally carries no payload. */
+const EMPTY_INTERACTION_PAYLOAD = Object.freeze({ data: undefined }) as RSocketPayloadInput<any, any>;
+
 /**
  * Low-level options after immutable setup and WebSocket endpoint normalization.
  */
-type PreparedRSocketClientOptions = RSocketClientOptions & {
+type PreparedRSocketClientOptions<D, M> = RSocketClientOptions<D, M> & {
   /** Cached normalized setup/options reused by physical reconnect attempts. */
   readonly normalizedOptions: NormalizedClientOptions;
 };
@@ -322,39 +330,42 @@ function addDeferredDemand(current: number, next: number): number {
 /**
  * Disconnected state surface returned by `disconnect()`.
  */
-interface DisconnectedRSocket {
+interface DisconnectedRSocket<D, M> {
   /** Opens the WebSocket and sends the RSocket SETUP frame. */
-  connect(): Mono<ConnectedRSocket>;
+  connect(): Mono<ConnectedRSocket<D, M>>;
   /** Executes a declarative controller through its declared interaction model. */
-  process<C extends AnyRSocketController>(
+  process<C extends AnyClassController>(
     controllerDefinition: RSocketControllerInput<C>,
     ...args: ControllerArgs<C>
   ): ControllerReturn<C>;
   /** Sends a fire-and-forget request after a connection is available. */
-  fireAndForget<C extends FireAndForgetControllerDefinition<readonly any[]>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
+  fireAndForget<PD = D, PM = M>(
+    data?: RSocketDataArgument<NoInfer<PD>>,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
   ): Mono<void>;
-  fireAndForget<D = unknown, M = unknown>(payload: RSocketPayloadInput<D, M>, options?: RSocketRequestOptions): Mono<void>;
   /** Sends a request-response request after a connection is available. */
-  requestResponse<C extends RequestResponseControllerDefinition<readonly any[], any>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Mono<RequestResponseResult<C>>;
-  requestResponse<D = unknown, M = unknown>(payload: RSocketPayloadInput<D, M>, options?: RSocketRequestOptions): Mono<RSocketPayloadFrame>;
+  requestResponse<PD = D, PM = M>(
+    data?: RSocketDataArgument<NoInfer<PD>>,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
+  ): Mono<RSocketPayloadFrame<PD, PM>>;
   /** Sends a request-stream request after a connection is available. */
-  requestStream<C extends RequestStreamControllerDefinition<readonly any[], any>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Flux<RequestStreamResult<C>>;
-  requestStream<D = unknown, M = unknown>(payload: RSocketPayloadInput<D, M>, options?: RSocketStreamRequestOptions): RSocketFlux;
+  requestStream<PD = D, PM = M>(
+    data?: RSocketDataArgument<NoInfer<PD>>,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
+  ): RSocketFlux<RSocketPayloadFrame<PD, PM>>;
   /** Starts request-channel after a connection is available. */
-  requestChannel<C extends RequestChannelControllerDefinition<readonly any[], any>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Flux<RequestChannelResult<C>>;
-  requestChannel<D = unknown, M = unknown>(payloads: RSocketChannelInput<D, M>, options?: RSocketStreamRequestOptions): RSocketFlux;
-  requestChannel<D = unknown, M = unknown>(options?: RSocketStreamRequestOptions): RSocketChannel<D, M>;
+  requestChannel<
+    PD = D,
+    PM = M,
+    Input extends RSocketChannelInput<NoInfer<PD>, NoInfer<PM>> | undefined = undefined
+  >(
+    data?: Input,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
+  ): RSocketChannelReturn<PD, PM, Input>;
   /** Sends a connection-level METADATA_PUSH frame. */
   metadataPush<M = unknown>(metadataPayload: M | Metadata<M>, options?: RSocketRequestOptions): Mono<void>;
   /** Updates MIME-keyed defaults merged into subsequent outgoing metadata. */
@@ -364,9 +375,9 @@ interface DisconnectedRSocket {
 /**
  * Connected state surface returned by `connect()`.
  */
-interface ConnectedRSocket extends Omit<DisconnectedRSocket, "connect"> {
+interface ConnectedRSocket<D, M> extends Omit<DisconnectedRSocket<D, M>, "connect"> {
   /** Disconnects the active session and returns the disconnected surface. */
-  disconnect(code?: number, reason?: string): DisconnectedRSocket;
+  disconnect(code?: number, reason?: string): DisconnectedRSocket<D, M>;
 }
 
 /**
@@ -376,8 +387,8 @@ interface ConnectedRSocket extends Omit<DisconnectedRSocket, "connect"> {
  * low-level WebSocket session. Every interaction is executed through Reactor
  * `Mono` or `Flux` types from `reactor-core-ts`.
  */
-export class RSocket {
-  private readonly clientOptions: RSocketClientOptions;
+export class RSocket<D = unknown, M = unknown> {
+  private readonly clientOptions: RSocketClientOptions<D, M>;
   private readonly reconnectOptions: RSocketReconnectOptions;
   private readonly resumeOptions: RSocketResumeOptions;
   private readonly setupMetadataMimeType: MimeType<any>;
@@ -402,26 +413,26 @@ export class RSocket {
   private connectAbortController: AbortController | undefined;
   private connecting = false;
   private closeRequested = true;
-  private validatedClientOptions: RSocketClientOptions | undefined;
+  private validatedClientOptions: RSocketClientOptions<D, M> | undefined;
   private lastError: unknown;
   private disposeWakeListener: (() => void) | undefined;
   /** Connected state facade with a deliberately tiny public surface. */
-  private readonly connectedSurface: ConnectedRSocket = Object.freeze({
-    process: this.process.bind(this) as ConnectedRSocket["process"],
-    fireAndForget: this.fireAndForget.bind(this) as ConnectedRSocket["fireAndForget"],
-    requestResponse: this.requestResponse.bind(this) as ConnectedRSocket["requestResponse"],
-    requestStream: this.requestStream.bind(this) as ConnectedRSocket["requestStream"],
-    requestChannel: this.requestChannel.bind(this) as ConnectedRSocket["requestChannel"],
-    metadataPush: this.metadataPush.bind(this) as ConnectedRSocket["metadataPush"],
+  private readonly connectedSurface: ConnectedRSocket<D, M> = Object.freeze({
+    process: this.process.bind(this) as ConnectedRSocket<D, M>["process"],
+    fireAndForget: this.fireAndForget.bind(this) as ConnectedRSocket<D, M>["fireAndForget"],
+    requestResponse: this.requestResponse.bind(this) as ConnectedRSocket<D, M>["requestResponse"],
+    requestStream: this.requestStream.bind(this) as ConnectedRSocket<D, M>["requestStream"],
+    requestChannel: this.requestChannel.bind(this) as ConnectedRSocket<D, M>["requestChannel"],
+    metadataPush: this.metadataPush.bind(this) as ConnectedRSocket<D, M>["metadataPush"],
     metadataUpdate: this.metadataUpdate.bind(this),
     disconnect: (code?: number, reason?: string) => this.disconnectNow(code, reason)
   });
   /** Controller execution surface reused by every declarative controller call. */
   private readonly controllerSurface: RSocketControllerConnection = Object.freeze({
     fireAndForget: (payload: RSocketPayloadInput<any, any>, options?: RSocketRequestOptions) =>
-      this.fireAndForget(payload, options),
+      this.fireAndForgetPayload(payload, normalizeFacadeRequestOptions(options)),
     requestResponse: (payload: RSocketPayloadInput<any, any>, options?: RSocketRequestOptions) =>
-      this.requestResponse(payload, options) as Mono<RSocketPayloadFrame>,
+      this.requestResponsePayload(payload, normalizeFacadeRequestOptions(options)),
     requestStream: (payload: RSocketPayloadInput<any, any>, options?: RSocketStreamRequestOptions) => this.requestStreamFlux(
       payload,
       normalizeFacadeRequestOptions(options)
@@ -435,9 +446,12 @@ export class RSocket {
   /**
    * Creates a disconnected browser WebSocket RSocket requester.
    */
-  constructor(url: string | URL, options?: RSocketOptions);
-  constructor(options: RSocketConstructorOptions);
-  constructor(urlOrOptions: string | URL | RSocketConstructorOptions, options: RSocketOptions = {}) {
+  constructor(url: string | URL, options?: RSocketOptions<D, M>);
+  constructor(options: RSocketConstructorOptions<D, M>);
+  constructor(
+    urlOrOptions: string | URL | RSocketConstructorOptions<D, M>,
+    options: RSocketOptions<D, M> = {}
+  ) {
     const resolved = resolveConstructorOptions(urlOrOptions, options);
     if (resolved.options.log !== undefined) this.configureLog(resolved.options.log);
     if (resolved.options.events !== undefined) this.registerEventHandlers(resolved.options.events);
@@ -461,14 +475,14 @@ export class RSocket {
    * The returned `Mono` is cold: the connection attempt starts when the Mono is
    * subscribed or blocked.
    */
-  connect(): Mono<ConnectedRSocket> {
+  connect(): Mono<ConnectedRSocket<D, M>> {
     return Mono.defer(() => this.connectNow());
   }
 
   /**
    * Starts or joins the current connection attempt for `connect()`.
    */
-  private connectNow(): Mono<ConnectedRSocket> {
+  private connectNow(): Mono<ConnectedRSocket<D, M>> {
     if (this.connected) return Mono.just(this.connectedFacade());
     try {
       this.validateConnectOptions();
@@ -502,7 +516,7 @@ export class RSocket {
   /**
    * Disconnects the active session but keeps the facade reusable.
    */
-  private disconnectNow(code?: number, reason = "RSocket client disconnected"): DisconnectedRSocket {
+  private disconnectNow(code?: number, reason = "RSocket client disconnected"): DisconnectedRSocket<D, M> {
     if (this.closeRequested && this.client === undefined && !this.connecting && this.reconnectTimer === undefined) {
       return this.disconnectedFacade();
     }
@@ -536,7 +550,7 @@ export class RSocket {
   /**
    * Executes a declarative controller through its declared interaction model.
    */
-  process<C extends AnyRSocketController>(
+  process<C extends AnyClassController>(
     controllerDefinition: RSocketControllerInput<C>,
     ...args: ControllerArgs<C>
   ): ControllerReturn<C> {
@@ -546,133 +560,67 @@ export class RSocket {
   /**
    * Sends a fire-and-forget request after a connection is available.
    */
-  fireAndForget<C extends FireAndForgetControllerDefinition<readonly any[]>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Mono<void>;
-  fireAndForget<D = unknown, M = unknown>(
-    payload: RSocketPayloadInput<D, M>,
-    options?: RSocketRequestOptions
-  ): Mono<void>;
-  fireAndForget<D = unknown, M = unknown>(
-    payloadOrController: RSocketPayloadInput<D, M> | RSocketControllerInput<FireAndForgetControllerDefinition<readonly any[]>>,
-    optionsOrArg?: RSocketRequestOptions | unknown,
-    ...args: unknown[]
+  fireAndForget<PD = D, PM = M>(
+    data?: RSocketDataArgument<NoInfer<PD>>,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
   ): Mono<void> {
-    if (isControllerInput(payloadOrController)) {
-      return this.processControllerInput(
-        "fireAndForget",
-        payloadOrController,
-        controllerArgs(arguments.length, optionsOrArg, args)
-      ) as Mono<void>;
-    }
-    const payload = payloadOrController as RSocketPayloadInput<D, M>;
-    const normalized = normalizeFacadeRequestOptions(optionsOrArg as RSocketRequestOptions | undefined);
-    return this.withReadyClientMono((client) => client.fireAndForget(
-      this.withClientMetadata(payload, normalized),
-      this.withClientMetadataOptions(normalized)
-    ));
+    return this.fireAndForgetPayload(
+      interactionPayload(data, metadata),
+      requestOptionsFromMimeTypes(mimetype)
+    );
   }
 
   /**
    * Sends a request-response request and emits the single decoded response.
    */
-  requestResponse<C extends RequestResponseControllerDefinition<readonly any[], any>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Mono<RequestResponseResult<C>>;
-  requestResponse<D = unknown, M = unknown>(
-    payload: RSocketPayloadInput<D, M>,
-    options?: RSocketRequestOptions
-  ): Mono<RSocketPayloadFrame>;
-  requestResponse<D = unknown, M = unknown>(
-    payloadOrController: RSocketPayloadInput<D, M> | RSocketControllerInput<RequestResponseControllerDefinition<readonly any[], any>>,
-    optionsOrArg?: RSocketRequestOptions | unknown,
-    ...args: unknown[]
-  ): Mono<RSocketPayloadFrame> | Mono<unknown> {
-    if (isControllerInput(payloadOrController)) {
-      return this.processControllerInput(
-        "requestResponse",
-        payloadOrController,
-        controllerArgs(arguments.length, optionsOrArg, args)
-      ) as Mono<unknown>;
-    }
-    const payload = payloadOrController as RSocketPayloadInput<D, M>;
-    const normalized = normalizeFacadeRequestOptions(optionsOrArg as RSocketRequestOptions | undefined);
-    return this.withReadyClientMono((client) => client.requestResponse(
-      this.withClientMetadata(payload, normalized),
-      this.withClientMetadataOptions(normalized)
-    ));
+  requestResponse<PD = D, PM = M>(
+    data?: RSocketDataArgument<NoInfer<PD>>,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
+  ): Mono<RSocketPayloadFrame<PD, PM>> {
+    return this.requestResponsePayload(
+      interactionPayload(data, metadata),
+      requestOptionsFromMimeTypes(mimetype)
+    );
   }
 
   /**
    * Sends a request-stream request and returns a demand-aware `Flux`.
    */
-  requestStream<C extends RequestStreamControllerDefinition<readonly any[], any>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Flux<RequestStreamResult<C>>;
-  requestStream<D = unknown, M = unknown>(
-    payload: RSocketPayloadInput<D, M>,
-    options?: RSocketStreamRequestOptions
-  ): RSocketFlux;
-  requestStream<D = unknown, M = unknown>(
-    payloadOrController: RSocketPayloadInput<D, M> | RSocketControllerInput<RequestStreamControllerDefinition<readonly any[], any>>,
-    optionsOrArg?: RSocketStreamRequestOptions | unknown,
-    ...args: unknown[]
-  ): RSocketFlux | Flux<unknown> {
-    if (isControllerInput(payloadOrController)) {
-      return this.processControllerInput(
-        "requestStream",
-        payloadOrController,
-        controllerArgs(arguments.length, optionsOrArg, args)
-      ) as Flux<unknown>;
-    }
-    const payload = payloadOrController as RSocketPayloadInput<D, M>;
-    return this.requestStreamFlux(payload, normalizeFacadeRequestOptions(optionsOrArg as RSocketStreamRequestOptions | undefined));
+  requestStream<PD = D, PM = M>(
+    data?: RSocketDataArgument<NoInfer<PD>>,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
+  ): RSocketFlux<RSocketPayloadFrame<PD, PM>> {
+    return this.requestStreamFlux(
+      interactionPayload(data, metadata),
+      requestOptionsFromMimeTypes(mimetype)
+    );
   }
 
   /**
    * Starts request-channel from an existing outbound payload source.
    */
-  requestChannel<C extends RequestChannelControllerDefinition<readonly any[], any>>(
-    controllerDefinition: RSocketControllerInput<C>,
-    ...args: ControllerArgs<C>
-  ): Flux<RequestChannelResult<C>>;
-  requestChannel<D = unknown, M = unknown>(
-    payloads: RSocketChannelInput<D, M>,
-    options?: RSocketStreamRequestOptions
-  ): RSocketFlux;
-  /**
-   * Creates an imperative request-channel helper with a sink-like API.
-   */
-  requestChannel<D = unknown, M = unknown>(
-    options?: RSocketStreamRequestOptions
-  ): RSocketChannel<D, M>;
-  /**
-   * Starts request-channel either from an existing source or as an imperative
-   * helper, depending on the first argument.
-   */
-  requestChannel<D = unknown, M = unknown>(
-    payloadsOrControllerOrOptions?: RSocketChannelInput<D, M> | RSocketStreamRequestOptions | RSocketControllerInput<RequestChannelControllerDefinition<readonly any[], any>>,
-    optionsOrArg?: RSocketStreamRequestOptions | unknown,
-    ...args: unknown[]
-  ): RSocketFlux | RSocketChannel<D, M> | Flux<unknown> {
-    if (isControllerInput(payloadsOrControllerOrOptions)) {
-      return this.processControllerInput(
-        "requestChannel",
-        payloadsOrControllerOrOptions,
-        controllerArgs(arguments.length, optionsOrArg, args)
-      ) as Flux<unknown>;
+  requestChannel<
+    PD = D,
+    PM = M,
+    Input extends RSocketChannelInput<NoInfer<PD>, NoInfer<PM>> | undefined = undefined
+  >(
+    data?: Input,
+    metadata?: RSocketMetadataArgument<NoInfer<PM>>,
+    mimetype?: RSocketMimeTypes<PD, PM>
+  ): RSocketChannelReturn<PD, PM, Input> {
+    const options = requestOptionsFromMimeTypes(mimetype);
+    if (data === undefined) {
+      return new RSocketChannel<PD, PM>(
+        (payloads) => this.requestChannelFlux(channelInputWithMetadata(payloads, metadata), options)
+      ) as RSocketChannelReturn<PD, PM, Input>;
     }
-    const payloadsOrOptions = payloadsOrControllerOrOptions as RSocketChannelInput<D, M> | RSocketStreamRequestOptions | undefined;
-    if (payloadsOrOptions === undefined || isRequestOptions(payloadsOrOptions)) {
-      const normalized = normalizeFacadeRequestOptions(payloadsOrOptions);
-      return new RSocketChannel<D, M>(
-        (payloads) => this.requestChannelFlux(payloads, normalized)
-      );
-    }
-    return this.requestChannelFlux(payloadsOrOptions, normalizeFacadeRequestOptions(optionsOrArg as RSocketStreamRequestOptions | undefined));
+    return this.requestChannelFlux(
+      channelInputWithMetadata(data, metadata),
+      options
+    ) as RSocketChannelReturn<PD, PM, Input>;
   }
 
   /**
@@ -698,28 +646,35 @@ export class RSocket {
   }
 
   /**
-   * Executes a declarative controller through the matching request method.
-   */
-  private processControllerInput(
-    expectedKind: AnyRSocketController["kind"],
-    controllerDefinition: RSocketControllerInput<AnyRSocketController>,
-    args: readonly unknown[]
-  ): ControllerReturn<AnyRSocketController> {
-    const controller = controllerInstance(controllerDefinition, this.controllerInstances);
-    if (controller.kind !== expectedKind) {
-      throw new RSocketConnectionError(`Controller kind ${controller.kind} cannot be used with ${expectedKind}.`);
-    }
-    return this.executeController(controller, args as ControllerArgs<AnyRSocketController>);
-  }
-
-  /**
    * Executes an already materialized controller against this socket facade.
    */
-  private executeController<C extends AnyRSocketController>(
+  private executeController<C extends AnyClassController>(
     controller: C,
     args: ControllerArgs<C>
   ): ControllerReturn<C> {
     return processController(this.controllerSurface, controller, args);
+  }
+
+  /** Sends one already assembled fire-and-forget payload. */
+  private fireAndForgetPayload(
+    payload: RSocketPayloadInput<any, any>,
+    options: RSocketRequestOptions
+  ): Mono<void> {
+    return this.withReadyClientMono((client) => client.fireAndForget(
+      this.withClientMetadata(payload, options),
+      this.withClientMetadataOptions(options)
+    ));
+  }
+
+  /** Sends one already assembled request-response payload. */
+  private requestResponsePayload<PD, PM>(
+    payload: RSocketPayloadInput<PD, PM>,
+    options: RSocketRequestOptions
+  ): Mono<RSocketPayloadFrame<PD, PM>> {
+    return this.withReadyClientMono((client) => client.requestResponse(
+      this.withClientMetadata(payload, options),
+      this.withClientMetadataOptions(options)
+    )) as Mono<RSocketPayloadFrame<PD, PM>>;
   }
 
   /**
@@ -728,11 +683,11 @@ export class RSocket {
   private requestStreamFlux<D, M>(
     payload: RSocketPayloadInput<D, M>,
     options: RSocketStreamRequestOptions
-  ): RSocketFlux {
+  ): RSocketFlux<RSocketPayloadFrame<D, M>> {
     return this.withReadyClientFlux((client) => client.requestStream(
       this.withClientMetadata(payload, options),
       this.withClientMetadataOptions(options)
-    ));
+    )) as RSocketFlux<RSocketPayloadFrame<D, M>>;
   }
 
   /**
@@ -741,11 +696,11 @@ export class RSocket {
   private requestChannelFlux<D, M>(
     payloads: RSocketChannelInput<D, M>,
     options: RSocketStreamRequestOptions
-  ): RSocketFlux {
+  ): RSocketFlux<RSocketPayloadFrame<D, M>> {
     return this.withReadyClientFlux((client) => client.requestChannel(
       this.withClientMetadataInput(payloads, options),
       this.withClientMetadataOptions(options)
-    ));
+    )) as RSocketFlux<RSocketPayloadFrame<D, M>>;
   }
 
   /**
@@ -820,7 +775,7 @@ export class RSocket {
    * Waits for browser network availability, then performs RESUME or SETUP.
    */
   private async openReadyConnection(
-    clientOptions: RSocketClientOptions,
+    clientOptions: RSocketClientOptions<D, M>,
     reconnect: boolean,
     attempt: number
   ): Promise<BrowserRSocketClient> {
@@ -1213,7 +1168,10 @@ export class RSocket {
     const client = this.currentClient();
     if (client !== undefined) return client;
     if (this.closeRequested) {
-      throw new RSocketConnectionError("RSocket is disconnected. Subscribe to socket.connect() before starting interactions.", this.lastError);
+      throw new RSocketConnectionError(
+        "RSocket is disconnected. Subscribe to socket.connect() before starting interactions.",
+        this.lastError
+      );
     }
     throw new RSocketConnectionError(
       "RSocket is not connected. Subscribe to socket.connect() before starting interactions.",
@@ -1232,22 +1190,40 @@ export class RSocket {
       ...this.clientOptions,
       webSocketEndpoint,
       normalizedOptions
-    } as PreparedRSocketClientOptions;
+    } as PreparedRSocketClientOptions<D, M>;
   }
 
   /**
    * Returns this instance narrowed to the connected state surface.
    */
-  private connectedFacade(): ConnectedRSocket {
+  private connectedFacade(): ConnectedRSocket<D, M> {
     return this.connectedSurface;
   }
 
   /**
    * Returns this instance narrowed to the disconnected state surface.
    */
-  private disconnectedFacade(): DisconnectedRSocket {
-    return this as unknown as DisconnectedRSocket;
+  private disconnectedFacade(): DisconnectedRSocket<D, M> {
+    return this as unknown as DisconnectedRSocket<D, M>;
   }
+}
+
+/** Builds an internal payload envelope from the positional public arguments. */
+function interactionPayload(data: unknown, metadata: unknown): RSocketPayloadInput<any, any> {
+  if (data === undefined) {
+    return metadata === undefined ? EMPTY_INTERACTION_PAYLOAD : { metadata };
+  }
+  return metadata === undefined ? { data } : { data, metadata };
+}
+
+/** Prepends positional request-channel metadata to the initial channel frame. */
+function channelInputWithMetadata(
+  input: RSocketChannelInput<any, any>,
+  metadata: unknown
+): RSocketChannelInput<any, any> {
+  return metadata === undefined
+    ? input
+    : prependChannelPayload(interactionPayload(undefined, metadata), input);
 }
 
 /**
