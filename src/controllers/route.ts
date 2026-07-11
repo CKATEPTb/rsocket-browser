@@ -1,10 +1,10 @@
 /**
  * Route metadata helpers for route-based declarative controllers.
  */
-import { prependChannelPayload } from "@/channel/input.js";
-import { route } from "@/payload/index.js";
-import type { RSocketChannelInput, RSocketPayloadInput } from "@/types/index.js";
-import type { RSocketControllerRoute } from "@/controllers/types.js";
+import {prependChannelPayload} from "@/channel/input.js";
+import {route} from "@/payload/index.js";
+import type {RSocketChannelInput, RSocketPayloadInput} from "@/types/index.js";
+import type {RSocketControllerRoute} from "@/controllers/types.js";
 
 /**
  * Cached builder for route-bearing payloads.
@@ -23,7 +23,7 @@ export type RSocketRouteChannelInputFactory = (input: RSocketChannelInput<any, a
  * is useful as the first frame of a routed request-channel interaction.
  */
 export function routePayload(controllerRoute: RSocketControllerRoute, payload?: unknown): RSocketPayloadInput {
-  return routePayloadFactory(controllerRoute)(payload);
+    return routePayloadFactory(controllerRoute)(payload);
 }
 
 /**
@@ -31,35 +31,35 @@ export function routePayload(controllerRoute: RSocketControllerRoute, payload?: 
  * composite metadata according to the configured metadata MIME.
  */
 export function routePayloadFactory(controllerRoute: RSocketControllerRoute): RSocketRoutePayloadFactory {
-  const metadata = routeEntry(controllerRoute);
-  const metadataOnlyPayload = Object.freeze({ metadata });
-  return (payload?: unknown) => {
-    if (payload === undefined) return metadataOnlyPayload;
-    return { data: payload, metadata };
-  };
+    const metadata = routeEntry(controllerRoute);
+    const metadataOnlyPayload = Object.freeze({metadata});
+    return (payload?: unknown) => {
+        if (payload === undefined) return metadataOnlyPayload;
+        return {data: payload, metadata};
+    };
 }
 
 /**
  * Precomputes route metadata for repeated request-channel input creation.
  */
 export function routeChannelInputFactory(controllerRoute: RSocketControllerRoute): RSocketRouteChannelInputFactory {
-  const routedPayload = routePayloadFactory(controllerRoute);
-  return (input) => prependChannelPayload(routedPayload(), input);
+    const routedPayload = routePayloadFactory(controllerRoute);
+    return (input) => prependChannelPayload(routedPayload(), input);
 }
 
 /**
  * Creates the routing metadata entry for one configured controller route.
  */
 function routeEntry(controllerRoute: RSocketControllerRoute) {
-  return typeof controllerRoute === "string" ? route(controllerRoute) : route(...controllerRoute);
+    return typeof controllerRoute === "string" ? route(controllerRoute) : route(...controllerRoute);
 }
 
 /**
  * Prepends route metadata to an outbound request-channel input source.
  */
 export function routeChannelInput(
-  controllerRoute: RSocketControllerRoute,
-  input: RSocketChannelInput<any, any>
+    controllerRoute: RSocketControllerRoute,
+    input: RSocketChannelInput<any, any>
 ): RSocketChannelInput {
-  return routeChannelInputFactory(controllerRoute)(input);
+    return routeChannelInputFactory(controllerRoute)(input);
 }

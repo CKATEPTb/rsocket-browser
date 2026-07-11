@@ -1,7 +1,7 @@
 /**
  * RSocket protocol defaults and well-known mime types used by the requester.
  */
-import { WellKnownMimeType, type MimeType } from "rsocket-frames-ts";
+import {type MimeType, WellKnownMimeType} from "rsocket-frames-ts";
 
 /** Largest legal Reactive Streams request count representable by REQUEST_N. */
 export const MAX_REQUEST_N = 0x7fffffff;

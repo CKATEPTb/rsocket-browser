@@ -1,10 +1,8 @@
 /**
  * Class-controller materialization helpers used by `RSocket.process(...)`.
  */
-import type { AnyClassController } from "@/controllers/classes.js";
-import type {
-  RSocketControllerConstructor
-} from "@/controllers/index.js";
+import type {AnyClassController} from "@/controllers/classes.js";
+import type {RSocketControllerConstructor} from "@/controllers/index.js";
 
 /**
  * Controller instance or zero-argument controller class accepted by `process(...)`.
@@ -20,23 +18,23 @@ export type RSocketControllerInput<C extends AnyClassController> = C | RSocketCo
  * controllers. Reusing their instance also reuses encoded route metadata.
  */
 export type RSocketControllerInstanceCache = WeakMap<
-  RSocketControllerConstructor<AnyClassController>,
-  AnyClassController
+    RSocketControllerConstructor<AnyClassController>,
+    AnyClassController
 >;
 
 /**
  * Creates a controller instance when a request method receives a controller class.
  */
 export function controllerInstance<C extends AnyClassController>(
-  controllerDefinition: RSocketControllerInput<C>,
-  cache?: RSocketControllerInstanceCache
+    controllerDefinition: RSocketControllerInput<C>,
+    cache?: RSocketControllerInstanceCache
 ): C {
-  if (typeof controllerDefinition === "function") {
-    const cached = cache?.get(controllerDefinition);
-    if (cached !== undefined) return cached as C;
-    const instance = new controllerDefinition();
-    cache?.set(controllerDefinition, instance);
-    return instance;
-  }
-  return controllerDefinition;
+    if (typeof controllerDefinition === "function") {
+        const cached = cache?.get(controllerDefinition);
+        if (cached !== undefined) return cached as C;
+        const instance = new controllerDefinition();
+        cache?.set(controllerDefinition, instance);
+        return instance;
+    }
+    return controllerDefinition;
 }
