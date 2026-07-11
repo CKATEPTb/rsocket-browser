@@ -65,10 +65,15 @@ import type {
     RSocketStreamRequestOptions,
 } from "@/types/index.js";
 import {createReactiveWebSocketConnection, type ReactiveWebSocketConnection} from "@/transport/websocket/connection.js";
-import {deserializeFrame, readFrameStreamId, readFrameTypeAndFlags} from "@/transport/websocket/frames.js";
-import {WS_CLOSE_RSOCKET_PROTOCOL_ERROR, WS_OPEN} from "@/transport/websocket/constants.js";
+import {
+    deserializeFrame,
+    readFrameStreamId,
+    readFrameTypeAndFlags,
+    readKeepalivePosition
+} from "@/transport/websocket/frames.js";
+import {WS_CLOSE_NORMAL, WS_CLOSE_RSOCKET_PROTOCOL_ERROR, WS_OPEN} from "@/transport/websocket/constants.js";
 import {validateWebSocketClose} from "@/transport/websocket/spec.js";
-import type {RSocketResumeState} from "@/resume/index.js";
+import {RSocketReplayBuffer, type RSocketResumeState} from "@/resume/index.js";
 
 /**
  * Options required to start a protocol Resume handshake.
@@ -76,6 +81,8 @@ import type {RSocketResumeState} from "@/resume/index.js";
 interface ResumeHandshake {
     /** Last positions captured from the previous physical connection. */
     readonly state: RSocketResumeState;
+    /** Suspended logical session whose active streams must survive Resume. */
+    readonly client: BrowserRSocketClient;
 }
 
 /**
@@ -129,10 +136,14 @@ export class BrowserRSocketClient implements StreamSession {
     private nextStreamId = 1;
     private clientPosition = 0n;
     private serverPosition = 0n;
-    /** Avoids BigInt position bookkeeping when protocol Resume is disabled. */
-    private readonly trackResumePositions: boolean;
+    /** Position/replay state allocated only for resumable logical sessions. */
+    private readonly replayBuffer: RSocketReplayBuffer | undefined;
+    private pendingFrames: Frame[] | undefined;
     private setupAccepted: boolean;
     private closed = false;
+    private suspended = false;
+    private terminated = false;
+    private gracefulCloseError: unknown;
     private closeError: unknown;
     private keepAliveTimer: ReturnType<typeof setInterval> | undefined;
     private lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -143,6 +154,7 @@ export class BrowserRSocketClient implements StreamSession {
     private activityListeners: Set<ActivityListener> | undefined;
     private readonly transportDisposables: Disposable[] = [];
     private readonly sendFragment = (frame: Frame): void => this.sendSerializedFrame(frame);
+    private connection: ReactiveWebSocketConnection;
 
     /**
      * Creates a client around an already-created reactive WebSocket transport.
@@ -151,15 +163,12 @@ export class BrowserRSocketClient implements StreamSession {
      * SETUP handshake performed by `connect`.
      */
     private constructor(
-        private readonly connection: ReactiveWebSocketConnection,
-        private readonly options: NormalizedClientOptions,
-        resumeState?: RSocketResumeState
+        connection: ReactiveWebSocketConnection,
+        private readonly options: NormalizedClientOptions
     ) {
-        this.clientPosition = resumeState?.clientPosition ?? 0n;
-        this.serverPosition = resumeState?.serverPosition ?? 0n;
-        this.trackResumePositions = options.setup.resumeToken !== undefined;
-        this.nextStreamId = resumeState?.nextStreamId ?? 1;
-        this.setupAccepted = resumeState !== undefined;
+        this.connection = connection;
+        this.replayBuffer = options.setup.resumeToken === undefined ? undefined : new RSocketReplayBuffer();
+        this.setupAccepted = false;
         this.attachConnection();
         if (options.activityListener !== undefined) this.onActivity(options.activityListener);
     }
@@ -186,7 +195,7 @@ export class BrowserRSocketClient implements StreamSession {
             client.startKeepAlive();
             return client;
         } catch (error) {
-            client.closeWithError(error, true);
+            client.terminateSession(error, true);
             throw error;
         }
     }
@@ -204,6 +213,11 @@ export class BrowserRSocketClient implements StreamSession {
             throw new RSocketProtocolError("RSocket Resume requires a resume token");
         }
 
+        const client = resume.client;
+        if (!client.suspended || client.terminated) {
+            throw new RSocketProtocolError("RSocket Resume requires a suspended logical session");
+        }
+
         const connection = createReactiveWebSocketConnection(
             options.webSocketFactory,
             options.url,
@@ -218,29 +232,18 @@ export class BrowserRSocketClient implements StreamSession {
             const frame = new ResumeFrame(
                 token,
                 resume.state.serverPosition,
-                resume.state.clientPosition,
+                resume.state.firstAvailableClientPosition,
                 normalized.setup.majorVersion,
                 normalized.setup.minorVersion
             );
             sendHandshakeFrame(connection, normalized, frame);
 
             const response = await receiveResumeOkFrame(connection, normalized, options.abortSignal);
-            if (response.lastReceivedClientPosition < resume.state.clientPosition) {
-                throw new RSocketProtocolError(
-                    "RSocket Resume requires client frame replay, but this browser client has no replay buffer"
-                );
-            }
             if (response.lastReceivedClientPosition > resume.state.clientPosition) {
                 throw new RSocketProtocolError("RSocket Resume responder acknowledged an impossible client position");
             }
 
-            const client = new BrowserRSocketClient(connection, normalized, {
-                clientPosition: response.lastReceivedClientPosition,
-                serverPosition: resume.state.serverPosition,
-                nextStreamId: resume.state.nextStreamId
-            });
-            client.assertHandshakeConnectionOpen();
-            client.startKeepAlive();
+            client.resumeWith(connection, response.lastReceivedClientPosition);
             return client;
         } catch (error) {
             try {
@@ -257,6 +260,11 @@ export class BrowserRSocketClient implements StreamSession {
      */
     get isClosed(): boolean {
         return this.closed;
+    }
+
+    /** Whether this logical session is waiting for a protocol Resume attempt. */
+    get isSuspended(): boolean {
+        return this.suspended && !this.terminated;
     }
 
     /**
@@ -286,8 +294,9 @@ export class BrowserRSocketClient implements StreamSession {
     resumeState(): RSocketResumeState {
         return {
             clientPosition: this.clientPosition,
-            serverPosition: this.serverPosition,
-            nextStreamId: this.nextStreamId
+            firstAvailableClientPosition: this.replayBuffer?.firstAvailablePosition(this.clientPosition) ??
+                this.clientPosition,
+            serverPosition: this.serverPosition
         };
     }
 
@@ -297,7 +306,7 @@ export class BrowserRSocketClient implements StreamSession {
     checkLifetime(now = Date.now()): boolean {
         if (this.closed) return false;
         if (now - this.lastReceivedAt < this.options.setup.lifetimeMs) return true;
-        this.closeWithError(new RSocketConnectionError("RSocket keepalive lifetime expired"), true);
+        this.loseTransport(new RSocketConnectionError("RSocket keepalive lifetime expired"), true);
         return false;
     }
 
@@ -306,15 +315,23 @@ export class BrowserRSocketClient implements StreamSession {
      */
     close(code = 1000, reason = "RSocket client closed"): void {
         validateWebSocketClose(code, reason);
-        if (this.closed) return;
+        if (this.terminated) return;
+        const wasActive = !this.closed;
         try {
-            if (this.connection.readyState === WS_OPEN) {
-                this.sendFrame(new ErrorFrame(0, FrameErrorCode.CONNECTION_CLOSE, errorPayload(reason)));
+            if (wasActive && this.connection.readyState === WS_OPEN) {
+                this.sendFrame(new ErrorFrame(0, FrameErrorCode.CONNECTION_ERROR, errorPayload(reason)));
             }
         } finally {
-            this.closeWithError(connectionClosedError(reason), false);
-            this.connection.close(code, reason);
+            this.terminateSession(connectionClosedError(reason), false);
+            if (wasActive) this.connection.close(code, reason);
         }
+    }
+
+    /**
+     * Terminates a suspended logical session when Resume will not be retried.
+     */
+    abandonResume(error: unknown = this.closeError): void {
+        this.terminateSession(error, false);
     }
 
     /**
@@ -396,7 +413,7 @@ export class BrowserRSocketClient implements StreamSession {
                     }, timeoutMs);
                 }
                 const encoded = this.encode(payload, options);
-                this.sendFrame(new RequestResponseFrame(streamId, FrameFlag.NONE, encoded.metadata, encoded.payload));
+                this.sendRequestFrame(new RequestResponseFrame(streamId, FrameFlag.NONE, encoded.metadata, encoded.payload));
             } catch (error) {
                 if (timeout !== undefined) clearTimeout(timeout);
                 timeout = undefined;
@@ -429,7 +446,7 @@ export class BrowserRSocketClient implements StreamSession {
                 this.assertCanStartRequest();
                 const streamId = this.allocateStreamId();
                 const encoded = this.encode(payload, options);
-                this.sendFrame(new RequestFireAndForgetFrame(streamId, FrameFlag.NONE, encoded.metadata, encoded.payload));
+                this.sendRequestFrame(new RequestFireAndForgetFrame(streamId, FrameFlag.NONE, encoded.metadata, encoded.payload));
                 sink.success();
             } catch (error) {
                 sink.error(error);
@@ -447,7 +464,7 @@ export class BrowserRSocketClient implements StreamSession {
         return this.createRequestFlux((streamId, initialRequestN) => {
             this.assertCanStartRequest();
             const encoded = this.encode(payload, options);
-            this.sendFrame(
+            this.sendRequestFrame(
                 new RequestStreamFrame(
                     streamId,
                     FrameFlag.NONE,
@@ -476,7 +493,7 @@ export class BrowserRSocketClient implements StreamSession {
                 options.dataMimeType ?? this.dataMimeType,
                 options.metadataMimeType ?? this.metadataMimeType,
                 () => subscription.markOutboundComplete(),
-                (error) => subscription.failOutbound(error)
+                (error, requestStarted) => subscription.failOutbound(error, requestStarted)
             );
             subscription.attachOutbound(outbound);
             outbound.start();
@@ -503,6 +520,12 @@ export class BrowserRSocketClient implements StreamSession {
      * Serializes and writes one frame to the active WebSocket immediately.
      */
     sendFrame(frame: Frame): void {
+        if (this.suspended) {
+            this.queueFrame(frame);
+            return;
+        }
+        if (this.terminated) throw connectionClosedError(this.closeError);
+
         const maxFrameLength = this.options.maxFrameLength;
         const frameLength = outboundFrameLength(frame);
         if (frameLength !== undefined && frameLength > maxFrameLength) {
@@ -530,13 +553,40 @@ export class BrowserRSocketClient implements StreamSession {
     }
 
     /**
+     * Sends an initial interaction frame and consumes a lease only once the
+     * request is ready for the wire.
+     */
+    sendRequestFrame(frame: Frame): void {
+        const consumesLease = this.options.setup.honorLease;
+        if (consumesLease) {
+            this.assertLeaseAvailable();
+            this.leaseRemaining -= 1;
+        }
+
+        try {
+            this.sendFrame(frame);
+        } catch (error) {
+            if (consumesLease) this.leaseRemaining += 1;
+            throw error;
+        }
+    }
+
+    /**
      * Serializes and writes one already-sized frame to the active WebSocket.
      */
     private sendSerializedFrame(frame: Frame, bytes = frame.toUint8Array()): void {
+        if (this.suspended) {
+            this.queueFrame(frame);
+            return;
+        }
         if (this.closed) throw connectionClosedError(this.closeError);
         if (this.connection.readyState !== WS_OPEN) {
             const error = new RSocketConnectionError("WebSocket is not open");
-            this.closeWithError(error, false);
+            this.loseTransport(error, false);
+            if (this.suspended) {
+                this.queueFrame(frame);
+                return;
+            }
             throw error;
         }
 
@@ -547,12 +597,21 @@ export class BrowserRSocketClient implements StreamSession {
 
         try {
             this.connection.sendNow(bytes);
-            if (this.trackResumePositions && isResumePositionFrame(frame.type)) {
-                this.clientPosition += BigInt(bytes.byteLength);
+            const replayBuffer = this.replayBuffer;
+            if (replayBuffer !== undefined && isResumePositionFrame(frame.type)) {
+                this.clientPosition = replayBuffer.record(
+                    this.clientPosition,
+                    this.activityListeners === undefined ? undefined : frame,
+                    bytes
+                );
             }
             if (this.activityListeners !== undefined) this.emitActivity("send", frame);
         } catch (error) {
-            this.closeWithError(error, true);
+            this.loseTransport(error, true);
+            if (this.suspended) {
+                this.queueFrame(frame);
+                return;
+            }
             throw error;
         }
     }
@@ -563,6 +622,11 @@ export class BrowserRSocketClient implements StreamSession {
     unregisterStream(streamId: number): void {
         this.streams.delete(streamId);
         this.fragments.delete(streamId);
+        if (this.streams.size === 0 && this.gracefulCloseError !== undefined) {
+            const error = this.gracefulCloseError;
+            this.gracefulCloseError = undefined;
+            this.terminateSession(error, true, WS_CLOSE_NORMAL, "RSocket connection closed");
+        }
     }
 
     /**
@@ -574,7 +638,7 @@ export class BrowserRSocketClient implements StreamSession {
         } catch {
             // Closing is still required even when the error frame cannot be written.
         }
-        this.closeWithError(error, true);
+        this.terminateSession(error, true);
     }
 
     /**
@@ -624,14 +688,18 @@ export class BrowserRSocketClient implements StreamSession {
      */
     private assertCanStartRequest(): void {
         if (this.closed) throw connectionClosedError(this.closeError);
+        if (this.gracefulCloseError !== undefined) {
+            throw new RSocketConnectionError("RSocket responder is closing the connection", this.gracefulCloseError);
+        }
         if (!this.options.setup.honorLease) return;
+        this.assertLeaseAvailable();
+    }
 
-        const now = Date.now();
-        if (this.leaseRemaining <= 0 || now >= this.leaseExpiresAt) {
+    /** Verifies that the current requester lease grants another interaction. */
+    private assertLeaseAvailable(): void {
+        if (this.leaseRemaining <= 0 || Date.now() >= this.leaseExpiresAt) {
             throw new RSocketLeaseError("No active RSocket lease is available for a new request");
         }
-
-        this.leaseRemaining -= 1;
     }
 
     /**
@@ -673,9 +741,82 @@ export class BrowserRSocketClient implements StreamSession {
             try {
                 this.sendFrame(new KeepaliveFrame(KeepaliveFlag.RESPOND, this.serverPosition, EMPTY_KEEPALIVE_PAYLOAD));
             } catch (error) {
-                this.closeWithError(error, true);
+                this.loseTransport(error, true);
             }
         }, keepAliveMs);
+    }
+
+    /**
+     * Attaches a replacement WebSocket, replays unacknowledged frames, and
+     * flushes frames produced by active streams while the transport was down.
+     */
+    private resumeWith(connection: ReactiveWebSocketConnection, peerPosition: bigint): void {
+        if (!this.suspended || this.terminated) {
+            throw new RSocketProtocolError("RSocket logical session is no longer resumable");
+        }
+
+        this.connection = connection;
+        this.closed = false;
+        this.suspended = true;
+        this.closeError = undefined;
+        this.setupAccepted = true;
+        this.leaseRemaining = 0;
+        this.leaseExpiresAt = 0;
+        this.attachConnection();
+
+        try {
+            const replayBuffer = this.replayBuffer;
+            if (replayBuffer === undefined) throw new RSocketProtocolError("RSocket session has no replay buffer");
+            replayBuffer.replayFrom(
+                peerPosition,
+                this.clientPosition,
+                (frame, bytes) => this.sendReplayFrame(frame, bytes)
+            );
+            this.assertHandshakeConnectionOpen();
+            this.suspended = false;
+            this.flushPendingFrames();
+            this.assertHandshakeConnectionOpen();
+            this.startKeepAlive();
+        } catch (error) {
+            this.loseTransport(error, true);
+            throw error;
+        }
+    }
+
+    /** Writes retained bytes without assigning a second implied position. */
+    private sendReplayFrame(frame: Frame | undefined, bytes: Uint8Array): void {
+        if (this.connection.readyState !== WS_OPEN) {
+            throw new RSocketConnectionError("WebSocket closed during RSocket frame replay");
+        }
+        this.connection.sendNow(bytes);
+        if (frame !== undefined && this.activityListeners !== undefined) this.emitActivity("send", frame);
+    }
+
+    /** Flushes stream frames queued while the logical session was suspended. */
+    private flushPendingFrames(): void {
+        const frames = this.pendingFrames;
+        if (frames === undefined || frames.length === 0) {
+            this.pendingFrames = undefined;
+            return;
+        }
+
+        this.pendingFrames = undefined;
+        for (let index = 0; index < frames.length; index += 1) {
+            this.sendFrame(frames[index] as Frame);
+            if (!this.suspended) continue;
+
+            const pending = this.pendingFrames ??= [];
+            for (let remaining = index + 1; remaining < frames.length; remaining += 1) {
+                pending.push(frames[remaining] as Frame);
+            }
+            throw connectionClosedError(this.closeError);
+        }
+    }
+
+    /** Queues resumable work while dropping transport-scoped heartbeats. */
+    private queueFrame(frame: Frame): void {
+        if (frame.type === FrameType.KEEPALIVE) return;
+        (this.pendingFrames ??= []).push(frame);
     }
 
     /**
@@ -698,6 +839,7 @@ export class BrowserRSocketClient implements StreamSession {
      * Subscribes the RSocket session to WebSocket messages, errors, and closes.
      */
     private attachConnection(): void {
+        const connection = this.connection;
         const subscribe = (factory: () => Disposable): void => {
             if (this.closed) return;
             const disposable = factory();
@@ -705,15 +847,25 @@ export class BrowserRSocketClient implements StreamSession {
             else this.transportDisposables.push(disposable);
         };
 
-        subscribe(() => this.connection.messages.subscribe(
-            (bytes) => this.handleIncomingBytes(bytes),
-            (error) => this.protocolError(new RSocketProtocolError("Failed to decode incoming WebSocket message", {cause: error}))
+        subscribe(() => connection.messages.subscribe(
+            (bytes) => {
+                if (this.connection === connection) this.handleIncomingBytes(bytes);
+            },
+            (error) => {
+                if (this.connection === connection) {
+                    this.protocolError(new RSocketProtocolError("Failed to decode incoming WebSocket message", {cause: error}));
+                }
+            }
         ));
-        subscribe(() => this.connection.errors.subscribe((event) => {
-            this.closeWithError(new RSocketConnectionError("WebSocket error", event), true);
+        subscribe(() => connection.errors.subscribe((event) => {
+            if (this.connection === connection) {
+                this.loseTransport(new RSocketConnectionError("WebSocket error", event), true);
+            }
         }));
-        subscribe(() => this.connection.closes.subscribe(() => {
-            this.closeWithError(connectionClosedError("WebSocket closed"), false);
+        subscribe(() => connection.closes.subscribe(() => {
+            if (this.connection === connection) {
+                this.loseTransport(connectionClosedError("WebSocket closed"), false);
+            }
         }));
     }
 
@@ -731,22 +883,37 @@ export class BrowserRSocketClient implements StreamSession {
             const streamId = readFrameStreamId(bytes);
             const typeAndFlags = readFrameTypeAndFlags(bytes);
             const frameType = (typeAndFlags >>> 10) as FrameType;
-            const isPayloadFragment =
+            const payloadStream = frameType === FrameType.PAYLOAD
+                ? this.streams.get(streamId)
+                : undefined;
+            const decodePayloadAsRaw =
                 frameType === FrameType.PAYLOAD &&
-                ((typeAndFlags & PayloadFlag.FOLLOWS) !== 0 || this.fragments.has(streamId));
+                (
+                    (typeAndFlags & PayloadFlag.FOLLOWS) !== 0 ||
+                    this.fragments.has(streamId) ||
+                    payloadStream === undefined
+                );
             const frame = deserializeFrame(
                 bytes,
                 this.metadataMimeType,
                 this.dataMimeType,
-                isPayloadFragment ? FRAGMENT_MIME_OVERRIDES : undefined,
+                decodePayloadAsRaw ? FRAGMENT_MIME_OVERRIDES : undefined,
                 frameType
             );
-            if (this.trackResumePositions && isResumePositionFrame(frameType)) {
+            const replayBuffer = this.replayBuffer;
+            if (replayBuffer !== undefined && frameType === FrameType.KEEPALIVE) {
+                replayBuffer.acknowledge(readKeepalivePosition(bytes), this.clientPosition);
+            }
+            if (replayBuffer !== undefined && isResumePositionFrame(frameType)) {
                 this.serverPosition += BigInt(bytes.byteLength);
             }
             this.lastReceivedAt = Date.now();
             if (this.activityListeners !== undefined) this.emitActivity("receive", frame);
-            this.handleFrame(frame);
+            const dispatchStream = payloadStream !== undefined && this.activityListeners !== undefined &&
+                this.streams.get(streamId) !== payloadStream
+                ? undefined
+                : payloadStream;
+            this.handleFrame(frame, dispatchStream, streamId);
         } catch (error) {
             this.protocolError(new RSocketProtocolError("Failed to decode incoming RSocket frame", {cause: error}));
         }
@@ -755,10 +922,13 @@ export class BrowserRSocketClient implements StreamSession {
     /**
      * Dispatches one decoded frame to connection-level or stream-level handlers.
      */
-    private handleFrame(frame: Frame): void {
+    private handleFrame(frame: Frame, payloadStream: StreamController | undefined, streamId: number): void {
         const frameType = frame.type;
-        if (!this.validateFrameStreamId(frame)) return;
-        if (!this.setupAccepted && confirmsSetup(frame, this.streams.has(frame.header.streamId))) {
+        if (!this.validateFrameStreamId(frame, streamId)) return;
+        const activeStream = frameType === FrameType.PAYLOAD
+            ? payloadStream !== undefined
+            : this.streams.has(streamId);
+        if (!this.setupAccepted && confirmsSetup(frame, activeStream)) {
             this.setupAccepted = true;
         }
         switch (frameType) {
@@ -769,18 +939,18 @@ export class BrowserRSocketClient implements StreamSession {
                 this.handleLease(frame as LeaseFrame);
                 return;
             case FrameType.PAYLOAD:
-                this.handlePayloadFrame(frame as PayloadFrame);
+                this.handlePayloadFrame(frame as PayloadFrame, payloadStream);
                 return;
             case FrameType.ERROR:
                 this.handleErrorFrame(frame as ErrorFrame);
                 return;
             case FrameType.REQUEST_N: {
-                const stream = this.streams.get(frame.header.streamId);
+                const stream = this.streams.get(streamId);
                 if (stream !== undefined) stream.handleRequestN(frame as RequestNFrame);
                 return;
             }
             case FrameType.CANCEL: {
-                const stream = this.streams.get(frame.header.streamId);
+                const stream = this.streams.get(streamId);
                 if (stream !== undefined) stream.handleCancel();
                 return;
             }
@@ -800,8 +970,7 @@ export class BrowserRSocketClient implements StreamSession {
     /**
      * Enforces stream zero for connection frames that cannot be ignored leniently.
      */
-    private validateFrameStreamId(frame: Frame): boolean {
-        const streamId = frame.header.streamId;
+    private validateFrameStreamId(frame: Frame, streamId: number): boolean {
         const frameType = frame.type;
         const invalid = isStrictConnectionFrame(frameType) && streamId !== 0;
         if (!invalid) return true;
@@ -834,9 +1003,8 @@ export class BrowserRSocketClient implements StreamSession {
     /**
      * Reassembles fragmented payloads and forwards complete PAYLOAD frames.
      */
-    private handlePayloadFrame(frame: PayloadFrame): void {
+    private handlePayloadFrame(frame: PayloadFrame, stream: StreamController | undefined): void {
         const streamId = frame.header.streamId;
-        const stream = this.streams.get(streamId);
         if (stream === undefined) {
             this.fragments.delete(streamId);
             return;
@@ -854,12 +1022,35 @@ export class BrowserRSocketClient implements StreamSession {
         const streamId = frame.header.streamId;
         if (streamId === 0) {
             if (this.setupAccepted && isIgnoredPostSetupError(frame.code)) return;
-            this.closeWithError(errorFromFrame(frame), true);
+            if (isStreamErrorCode(frame.code)) {
+                this.protocolError(invalidErrorStreamId(frame));
+                return;
+            }
+            const error = errorFromFrame(frame);
+            if (frame.code === FrameErrorCode.CONNECTION_CLOSE) {
+                this.beginGracefulClose(error);
+                return;
+            }
+            this.terminateSession(error, true);
+            return;
+        }
+
+        if (isConnectionErrorCode(frame.code)) {
+            this.protocolError(invalidErrorStreamId(frame));
             return;
         }
 
         const stream = this.streams.get(streamId);
         if (stream !== undefined) stream.handleError(frame);
+    }
+
+    /** Stops new requests and waits for active streams after CONNECTION_CLOSE. */
+    private beginGracefulClose(error: unknown): void {
+        if (this.closed || this.gracefulCloseError !== undefined) return;
+        this.gracefulCloseError = error;
+        if (this.streams.size !== 0) return;
+        this.gracefulCloseError = undefined;
+        this.terminateSession(error, true, WS_CLOSE_NORMAL, "RSocket connection closed");
     }
 
     /**
@@ -896,16 +1087,44 @@ export class BrowserRSocketClient implements StreamSession {
     }
 
     /**
-     * Terminates the session, fails active streams, and optionally closes socket.
+     * Suspends a resumable logical session after transport loss, or terminates
+     * a non-resumable session immediately.
      */
-    private closeWithError(error: unknown, closeSocket: boolean): void {
+    private loseTransport(error: unknown, closeSocket: boolean): void {
         if (this.closed) return;
+        if (this.replayBuffer === undefined || this.gracefulCloseError !== undefined) {
+            this.terminateSession(error, closeSocket);
+            return;
+        }
+
         this.closed = true;
+        this.suspended = true;
         this.closeError = error;
-        if (this.keepAliveTimer !== undefined) clearInterval(this.keepAliveTimer);
-        this.keepAliveTimer = undefined;
-        if (this.lifetimeTimer !== undefined) clearTimeout(this.lifetimeTimer);
-        this.lifetimeTimer = undefined;
+        this.leaseRemaining = 0;
+        this.leaseExpiresAt = 0;
+        this.stopTransport();
+        this.emitClose(error);
+        if (closeSocket) this.closeTransportQuietly();
+    }
+
+    /**
+     * Terminates the logical session, fails active streams, and releases every
+     * retained replay/transport resource.
+     */
+    private terminateSession(
+        error: unknown,
+        closeSocket: boolean,
+        closeCode = WS_CLOSE_RSOCKET_PROTOCOL_ERROR,
+        closeReason = "RSocket protocol error"
+    ): void {
+        if (this.terminated) return;
+        const shouldEmitClose = !this.closed;
+        this.closed = true;
+        this.suspended = false;
+        this.terminated = true;
+        this.gracefulCloseError = undefined;
+        this.closeError = error;
+        this.stopTransport();
 
         for (const controller of this.streams.values()) {
             try {
@@ -916,6 +1135,21 @@ export class BrowserRSocketClient implements StreamSession {
         }
         this.streams.clear();
         this.fragments.clear();
+        this.pendingFrames = undefined;
+        this.replayBuffer?.clear();
+        this.activityListeners?.clear();
+        this.activityListeners = undefined;
+        if (shouldEmitClose) this.emitClose(error);
+        if (closeSocket) this.closeTransportQuietly(closeCode, closeReason);
+    }
+
+    /** Stops heartbeat timers and removes listeners from the current transport. */
+    private stopTransport(): void {
+        if (this.keepAliveTimer !== undefined) clearInterval(this.keepAliveTimer);
+        this.keepAliveTimer = undefined;
+        if (this.lifetimeTimer !== undefined) clearTimeout(this.lifetimeTimer);
+        this.lifetimeTimer = undefined;
+
         let disposable: Disposable | undefined;
         while ((disposable = this.transportDisposables.pop()) !== undefined) {
             try {
@@ -924,15 +1158,17 @@ export class BrowserRSocketClient implements StreamSession {
                 // Transport listener cleanup must not suppress the session close signal.
             }
         }
-        this.activityListeners?.clear();
-        this.emitClose(error);
+    }
 
-        if (closeSocket) {
-            try {
-                this.connection.close(WS_CLOSE_RSOCKET_PROTOCOL_ERROR, "RSocket protocol error");
-            } catch {
-                // The session is already closed locally; preserve the original failure.
-            }
+    /** Closes a failed physical WebSocket without replacing the primary error. */
+    private closeTransportQuietly(
+        code = WS_CLOSE_RSOCKET_PROTOCOL_ERROR,
+        reason = "RSocket protocol error"
+    ): void {
+        try {
+            this.connection.close(code, reason);
+        } catch {
+            // The logical session state already reflects the original failure.
         }
     }
 
@@ -972,7 +1208,12 @@ export class BrowserRSocketClient implements StreamSession {
  * Returns whether a frame type is valid only on stream zero.
  */
 function isStrictConnectionFrame(type: FrameType): boolean {
-    return type === FrameType.LEASE || type === FrameType.KEEPALIVE;
+    return type === FrameType.SETUP ||
+        type === FrameType.LEASE ||
+        type === FrameType.KEEPALIVE ||
+        type === FrameType.METADATA_PUSH ||
+        type === FrameType.RESUME ||
+        type === FrameType.RESUME_OK;
 }
 
 /**
@@ -983,6 +1224,33 @@ function isIgnoredPostSetupError(code: FrameErrorCode): boolean {
         code === FrameErrorCode.UNSUPPORTED_SETUP ||
         code === FrameErrorCode.REJECTED_SETUP ||
         code === FrameErrorCode.REJECTED_RESUME;
+}
+
+/** Returns whether a known ERROR code is valid only on stream zero. */
+function isConnectionErrorCode(code: FrameErrorCode): boolean {
+    return code === FrameErrorCode.INVALID_SETUP ||
+        code === FrameErrorCode.UNSUPPORTED_SETUP ||
+        code === FrameErrorCode.REJECTED_SETUP ||
+        code === FrameErrorCode.REJECTED_RESUME ||
+        code === FrameErrorCode.CONNECTION_ERROR ||
+        code === FrameErrorCode.CONNECTION_CLOSE;
+}
+
+/** Returns whether a known ERROR code requires a non-zero stream ID. */
+function isStreamErrorCode(code: FrameErrorCode): boolean {
+    return code === FrameErrorCode.APPLICATION_ERROR ||
+        code === FrameErrorCode.REJECTED ||
+        code === FrameErrorCode.CANCELED ||
+        code === FrameErrorCode.INVALID;
+}
+
+/** Creates a connection-level protocol error for an ERROR stream mismatch. */
+function invalidErrorStreamId(frame: ErrorFrame): RSocketProtocolError {
+    return new RSocketProtocolError("Responder sent ERROR with an invalid stream ID for its code", {
+        code: FrameErrorCode.CONNECTION_ERROR,
+        streamId: frame.header.streamId,
+        frame
+    });
 }
 
 /**

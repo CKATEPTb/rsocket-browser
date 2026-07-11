@@ -10,6 +10,7 @@ import {type MimeType, PayloadFlag, PayloadFrame, RequestChannelFlag, RequestCha
 import {canPrefetchChannelInput, channelInputIterator, type RSocketChannelInputIterator} from "@/channel/input.js";
 import {encodePayloadInput} from "@/payload/index.js";
 import {type OutboundChannel, type StreamSession} from "@/stream/index.js";
+import {addReactiveDemand} from "@/stream/demand.js";
 import type {RSocketChannelInput, RSocketPayloadInput} from "@/types/index.js";
 
 /**
@@ -48,6 +49,8 @@ export class RequestChannelOutbound implements OutboundChannel {
     private aborted = false;
     private iterator: RSocketChannelInputIterator<any, any> | undefined;
     private iteratorClosed = false;
+    /** Whether the peer has observed this stream's initial REQUEST_CHANNEL. */
+    private requestStarted = false;
     private demandWaiter: (() => void) | undefined;
 
     /**
@@ -61,7 +64,7 @@ export class RequestChannelOutbound implements OutboundChannel {
         private readonly dataMimeType: MimeType<any>,
         private readonly metadataMimeType: MimeType<any>,
         private readonly onComplete: () => void,
-        private readonly onError: (error: unknown) => void
+        private readonly onError: (error: unknown, requestStarted: boolean) => void
     ) {
     }
 
@@ -77,7 +80,7 @@ export class RequestChannelOutbound implements OutboundChannel {
      */
     addDemand(n: number): void {
         if (this.aborted || n <= 0) return;
-        this.demand = n >= Number.MAX_SAFE_INTEGER - this.demand ? Number.MAX_SAFE_INTEGER : this.demand + n;
+        this.demand = addReactiveDemand(this.demand, n);
         this.wakeDemand();
     }
 
@@ -107,19 +110,20 @@ export class RequestChannelOutbound implements OutboundChannel {
 
             if (first.done) {
                 this.iteratorClosed = true;
-                this.session.sendFrame(
+                this.session.sendRequestFrame(
                     new RequestChannelFrame(
                         this.streamId,
                         RequestChannelFlag.COMPLETE,
                         this.initialRequestN
                     )
                 );
+                this.requestStarted = true;
                 this.onComplete();
                 return;
             }
 
             const initial = encodePayloadInput(first.value, this.dataMimeType, this.metadataMimeType);
-            this.session.sendFrame(
+            this.session.sendRequestFrame(
                 new RequestChannelFrame(
                     this.streamId,
                     RequestChannelFlag.NONE,
@@ -128,6 +132,7 @@ export class RequestChannelOutbound implements OutboundChannel {
                     initial.payload
                 )
             );
+            this.requestStarted = true;
 
             let pending: MaybePromise<ChannelIteratorResult> | undefined;
             while (!this.aborted) {
@@ -167,7 +172,7 @@ export class RequestChannelOutbound implements OutboundChannel {
         } catch (error) {
             if (this.aborted) return;
             this.aborted = true;
-            this.onError(error);
+            this.onError(error, this.requestStarted);
         } finally {
             if (iterator !== undefined) {
                 if (this.iterator === iterator) this.iterator = undefined;

@@ -2,7 +2,7 @@
  * SETUP/RESUME handshake helpers used before the full client dispatcher starts.
  */
 import {type Disposable} from "reactor-core-ts";
-import {ErrorFrame, type Frame, type MimeType, ResumeOkFrame} from "rsocket-frames-ts";
+import {ErrorFrame, type Frame, FrameErrorCode, type MimeType, ResumeOkFrame} from "rsocket-frames-ts";
 import {
     connectionClosedError,
     errorFromFrame,
@@ -12,7 +12,8 @@ import {
 } from "@/errors/index.js";
 import type {RSocketFrameActivityListener} from "@/types/index.js";
 import type {ReactiveWebSocketConnection} from "@/transport/websocket/connection.js";
-import {deserializeFrame} from "@/transport/websocket/frames.js";
+import {WS_OPEN} from "@/transport/websocket/constants.js";
+import {deserializeFrame, readFrameStreamId} from "@/transport/websocket/frames.js";
 
 /**
  * Normalized options required by pre-client handshake helpers.
@@ -63,10 +64,18 @@ export async function receiveResumeOkFrame(
         throw new RSocketFrameSizeError(bytes.length, options.maxFrameLength);
     }
 
+    if (readFrameStreamId(bytes) !== 0) {
+        throw new RSocketProtocolError("RSocket Resume responder sent a handshake frame on a non-zero stream");
+    }
     const frame = deserializeFrame(bytes, options.setup.metadataMimeType, options.setup.dataMimeType);
     emitHandshakeActivity(options, "receive", frame);
     if (frame instanceof ResumeOkFrame) return frame;
-    if (frame instanceof ErrorFrame) throw errorFromFrame(frame);
+    if (frame instanceof ErrorFrame) {
+        if (frame.code !== FrameErrorCode.CONNECTION_ERROR && frame.code !== FrameErrorCode.REJECTED_RESUME) {
+            throw new RSocketProtocolError("RSocket Resume responder sent an invalid handshake ERROR code");
+        }
+        throw errorFromFrame(frame);
+    }
     throw new RSocketProtocolError("RSocket Resume expected RESUME_OK from responder");
 }
 
@@ -125,6 +134,10 @@ function receiveFirstMessage(
         }
         abortSignal?.addEventListener("abort", onAbort, {once: true});
         if (settled) return;
+        if (connection.readyState !== WS_OPEN) {
+            finish(() => reject(connectionClosedError("WebSocket closed during RSocket resume")));
+            return;
+        }
 
         if (timeoutMs !== undefined && timeoutMs > 0) {
             timeout = setTimeout(() => {

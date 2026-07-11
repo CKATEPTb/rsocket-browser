@@ -50,6 +50,17 @@ export function readFrameTypeAndFlags(buffer: Uint8Array): number {
 }
 
 /**
+ * Reads the 63-bit last-received position from a decoded KEEPALIVE frame.
+ */
+export function readKeepalivePosition(buffer: Uint8Array): bigint {
+    let position = BigInt((buffer[6] as number) & 0x7f);
+    for (let index = 7; index < 14; index += 1) {
+        position = (position << 8n) | BigInt(buffer[index] as number);
+    }
+    return position;
+}
+
+/**
  * Converts browser WebSocket message data into bytes.
  */
 export function messageDataToUint8Array(data: unknown): Uint8Array | Promise<Uint8Array> {

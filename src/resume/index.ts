@@ -11,10 +11,10 @@
 export interface RSocketResumeState {
     /** Last implied client-to-server byte position sent by this requester. */
     readonly clientPosition: bigint;
+    /** Earliest retained client position that can still be replayed. */
+    readonly firstAvailableClientPosition: bigint;
     /** Last implied server-to-client byte position received by this requester. */
     readonly serverPosition: bigint;
-    /** Next odd requester stream ID in the resumed logical session. */
-    readonly nextStreamId: number;
 }
 
 /**
@@ -57,14 +57,7 @@ export interface RSocketResumeOptionInput {
  */
 const DEFAULT_RESUME_TTL_MS = 300_000;
 
-/**
- * Empty position snapshot used before any frames have moved.
- */
-export const EMPTY_RESUME_STATE: RSocketResumeState = Object.freeze({
-    clientPosition: 0n,
-    serverPosition: 0n,
-    nextStreamId: 1
-});
+export {RSocketReplayBuffer} from "@/resume/replay.js";
 
 /**
  * Normalizes reconnect Resume options and generates an opaque token when needed.
@@ -87,7 +80,7 @@ export function normalizeResumeOptions(input: RSocketResumeOptionInput): RSocket
 /**
  * Creates an opaque browser-safe token when resume is enabled without one.
  */
-function createResumeToken(): string {
+export function createResumeToken(): string {
     const crypto = globalThis.crypto;
     if (crypto?.randomUUID !== undefined) return crypto.randomUUID();
     if (crypto?.getRandomValues !== undefined) {

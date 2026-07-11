@@ -51,10 +51,9 @@ import {
   type RSocketReconnectOptions
 } from "@/reconnect/index.js";
 import {
-  EMPTY_RESUME_STATE,
+  createResumeToken,
   normalizeResumeOptions,
-  type RSocketResumeOptions,
-  type RSocketResumeState
+  type RSocketResumeOptions
 } from "@/resume/index.js";
 import type {
   RSocketChannelInput,
@@ -68,6 +67,7 @@ import type {
 } from "@/types/index.js";
 import {RSocketConnectionError} from "@/errors/index.js";
 import {directRSocketFluxSubscription, RSocketFlux} from "@/stream/index.js";
+import {addReactiveDemand, normalizeReactiveDemand} from "@/stream/demand.js";
 import {
   EMPTY_REQUEST_OPTIONS,
   normalizeRequestOptions,
@@ -130,14 +130,17 @@ class DeferredRSocketFluxSubscription implements Subscription {
     private subscribed = false;
     private cancelled = false;
     private terminal = false;
+    /** Downstream callbacks released after cancellation or a terminal signal. */
+    private subscriber: Subscriber<RSocketPayloadFrame> | undefined;
 
     /**
      * Resolves the concrete source and attaches it to this outer subscription.
      */
     constructor(
-        private readonly subscriber: Subscriber<RSocketPayloadFrame>,
+        subscriber: Subscriber<RSocketPayloadFrame>,
         sourceFactory: () => DeferredFluxSource
     ) {
+        this.subscriber = subscriber;
         try {
             const source = sourceFactory();
             if (source instanceof RSocketFlux) this.subscribeTo(source);
@@ -158,8 +161,8 @@ class DeferredRSocketFluxSubscription implements Subscription {
             return;
         }
         try {
-            const request = normalizeDeferredRequest(n);
-            this.pendingRequested = addDeferredDemand(this.pendingRequested, request);
+            const request = normalizeReactiveDemand(n);
+            this.pendingRequested = addReactiveDemand(this.pendingRequested, request);
         } catch (error) {
             this.fail(error);
         }
@@ -173,7 +176,10 @@ class DeferredRSocketFluxSubscription implements Subscription {
         this.cancelled = true;
         this.pendingRequested = 0;
         this.pendingTerminal = undefined;
-        this.upstream?.cancel();
+        this.subscriber = undefined;
+        const upstream = this.upstream;
+        this.upstream = undefined;
+        upstream?.cancel();
     }
 
     /**
@@ -223,8 +229,10 @@ class DeferredRSocketFluxSubscription implements Subscription {
      */
     private next(value: RSocketPayloadFrame): void {
         if (this.cancelled || this.terminal) return;
+        const subscriber = this.subscriber;
+        if (subscriber === undefined) return;
         try {
-            this.subscriber.onNext(value);
+            subscriber.onNext(value);
         } catch (error) {
             this.abortWithError(error);
         }
@@ -243,8 +251,13 @@ class DeferredRSocketFluxSubscription implements Subscription {
         this.cancelled = true;
         this.pendingRequested = 0;
         this.pendingTerminal = undefined;
+        const subscriber = this.subscriber;
+        this.subscriber = undefined;
+        const upstream = this.upstream;
+        this.upstream = undefined;
+        upstream?.cancel();
         try {
-            this.subscriber.onError(error);
+            subscriber?.onError(error);
         } catch {
             // Subscriber failures are terminal for this stream and must not escape.
         }
@@ -262,8 +275,11 @@ class DeferredRSocketFluxSubscription implements Subscription {
         this.terminal = true;
         this.pendingRequested = 0;
         this.pendingTerminal = undefined;
+        const subscriber = this.subscriber;
+        this.subscriber = undefined;
+        this.upstream = undefined;
         try {
-            this.subscriber.onComplete();
+            subscriber?.onComplete();
         } catch {
             // Completion callback failures must not affect connection lifecycle.
         }
@@ -278,32 +294,17 @@ class DeferredRSocketFluxSubscription implements Subscription {
         this.cancelled = true;
         this.pendingRequested = 0;
         this.pendingTerminal = undefined;
-        this.upstream?.cancel();
+        const subscriber = this.subscriber;
+        this.subscriber = undefined;
+        const upstream = this.upstream;
+        this.upstream = undefined;
+        upstream?.cancel();
         try {
-            this.subscriber.onError(error);
+            subscriber?.onError(error);
         } catch {
             // The original subscriber callback already failed.
         }
     }
-}
-
-/**
- * Validates deferred demand before a concrete stream subscription exists.
- */
-function normalizeDeferredRequest(n: number): number {
-    if (n === Number.POSITIVE_INFINITY) return n;
-    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > Number.MAX_SAFE_INTEGER) {
-        throw new RangeError("Reactive Streams request(n) expects a strictly positive integer");
-    }
-    return n;
-}
-
-/**
- * Aggregates deferred demand without overflowing JavaScript's safe integer range.
- */
-function addDeferredDemand(current: number, next: number): number {
-    if (current === Number.POSITIVE_INFINITY || next === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
-    return Math.min(Number.MAX_SAFE_INTEGER, current + next);
 }
 
 /**
@@ -374,9 +375,9 @@ interface ConnectedRSocket<D, M> extends Omit<DisconnectedRSocket<D, M>, "connec
  * `Mono` or `Flux` types from `reactor-core-ts`.
  */
 export class RSocket<D = unknown, M = unknown> {
-    private readonly clientOptions: RSocketClientOptions<D, M>;
+    private clientOptions: RSocketClientOptions<D, M>;
     private readonly reconnectOptions: RSocketReconnectOptions;
-    private readonly resumeOptions: RSocketResumeOptions;
+    private resumeOptions: RSocketResumeOptions;
     private readonly setupMetadataMimeType: MimeType<any>;
     private readonly metadataState: RSocketMetadataState = new Map();
     /** Singleton class-controller instances scoped to this facade. */
@@ -393,7 +394,6 @@ export class RSocket<D = unknown, M = unknown> {
     private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     private stableConnectionTimer: ReturnType<typeof setTimeout> | undefined;
     private reconnectAttempts = 0;
-    private resumeState: RSocketResumeState = EMPTY_RESUME_STATE;
     private resumeDeadlineAt = 0;
     private connectToken = 0;
     private connectAbortController: AbortController | undefined;
@@ -402,6 +402,8 @@ export class RSocket<D = unknown, M = unknown> {
     private validatedClientOptions: RSocketClientOptions<D, M> | undefined;
     private lastError: unknown;
     private disposeWakeListener: (() => void) | undefined;
+    /** Suspended logical session retained while protocol Resume is possible. */
+    private resumeClient: BrowserRSocketClient | undefined;
     /** Connected state facade with a deliberately tiny public surface. */
     private readonly connectedSurface: ConnectedRSocket<D, M> = Object.freeze({
         process: this.process.bind(this) as ConnectedRSocket<D, M>["process"],
@@ -510,6 +512,7 @@ export class RSocket<D = unknown, M = unknown> {
         this.closeRequested = true;
         this.connectToken += 1;
         this.abortConnect();
+        this.connecting = false;
         this.clearReconnectTimer();
         this.clearStableConnectionTimer();
         this.clearWakeListener();
@@ -520,8 +523,14 @@ export class RSocket<D = unknown, M = unknown> {
         this.readyDeferred.reject(error);
 
         const client = this.client;
+        const resumeClient = this.resumeClient;
         this.client = undefined;
+        this.resumeClient = undefined;
         if (client) this.closeClientQuietly(client, code, reason);
+        if (resumeClient !== undefined && resumeClient !== client) {
+            this.closeClientQuietly(resumeClient, code, reason);
+        }
+        this.rotateResumeToken();
 
         this.emitLifecycle({
             type: "disconnect",
@@ -723,6 +732,7 @@ export class RSocket<D = unknown, M = unknown> {
                 if (this.connectAbortController === abortController) this.connectAbortController = undefined;
                 this.connecting = false;
                 this.client = client;
+                if (this.resumeClient === client) this.resumeClient = undefined;
                 this.lastError = undefined;
                 this.resumeDeadlineAt = 0;
                 this.markConnectionStableAfterUptime(client, reconnect);
@@ -765,18 +775,29 @@ export class RSocket<D = unknown, M = unknown> {
         reconnect: boolean,
         attempt: number
     ): Promise<BrowserRSocketClient> {
-        if (!browserReconnectSignals.isOnline()) {
+        if (reconnect && !browserReconnectSignals.isOnline()) {
             await browserReconnectSignals.waitUntilOnline(clientOptions.abortSignal);
         }
         if (!reconnect || !this.canAttemptResume()) {
-            return BrowserRSocketClient.connect(clientOptions);
+            const hadSuspendedSession = this.resumeClient !== undefined;
+            this.abandonResume(this.lastError);
+            if (!hadSuspendedSession) return BrowserRSocketClient.connect(clientOptions);
+            this.rotateResumeToken();
+            return BrowserRSocketClient.connect(withResumeToken(clientOptions, this.resumeOptions.token));
         }
 
+        const resumeClient = this.resumeClient;
+        if (resumeClient === undefined) return BrowserRSocketClient.connect(clientOptions);
         try {
-            return await BrowserRSocketClient.resume(clientOptions, {state: this.resumeState});
+            return await BrowserRSocketClient.resume(clientOptions, {
+                state: resumeClient.resumeState(),
+                client: resumeClient
+            });
         } catch (error) {
             if (clientOptions.abortSignal?.aborted) throw error;
-            if (error instanceof RSocketConnectionError) throw error;
+            if (error instanceof RSocketConnectionError || hasErrorCode(error, FrameErrorCode.CONNECTION_ERROR)) {
+                throw error;
+            }
             if (isRejectedResume(error)) {
                 this.emitLifecycle({
                     type: "resumeRejected",
@@ -787,7 +808,9 @@ export class RSocket<D = unknown, M = unknown> {
                 });
             }
             this.resumeDeadlineAt = 0;
-            return BrowserRSocketClient.connect(clientOptions);
+            this.abandonResume(error);
+            this.rotateResumeToken();
+            return BrowserRSocketClient.connect(withResumeToken(clientOptions, this.resumeOptions.token));
         }
     }
 
@@ -796,14 +819,16 @@ export class RSocket<D = unknown, M = unknown> {
      */
     private handleClientClose(client: BrowserRSocketClient, error: unknown): void {
         if (client !== this.client) return;
-        this.resumeState = client.resumeState();
+        const suspended = client.isSuspended;
+        this.resumeClient = suspended ? client : undefined;
+        if (!suspended) this.rotateResumeToken();
         this.client = undefined;
         this.lastError = error;
         this.clearStableConnectionTimer();
         if (this.closeRequested) return;
 
         this.ensureReadyPending();
-        this.startResumeWindow();
+        this.startResumeWindow(client);
         this.emitLifecycle({
             type: "disconnect",
             attempt: this.reconnectAttempts,
@@ -820,6 +845,7 @@ export class RSocket<D = unknown, M = unknown> {
     private scheduleReconnect(error: unknown): void {
         this.clearReconnectTimer();
         if (!this.canReconnect()) {
+            this.abandonResume(error);
             this.readyDeferred.reject(error);
             this.emitLifecycle({
                 type: "closed",
@@ -862,8 +888,8 @@ export class RSocket<D = unknown, M = unknown> {
     /**
      * Starts the bounded protocol Resume window after a physical session drops.
      */
-    private startResumeWindow(): void {
-        if (!this.resumeOptions.enabled || this.resumeOptions.token === undefined) {
+    private startResumeWindow(client: BrowserRSocketClient): void {
+        if (!client.isSuspended || !this.resumeOptions.enabled || this.resumeOptions.token === undefined) {
             this.resumeDeadlineAt = 0;
             return;
         }
@@ -876,6 +902,7 @@ export class RSocket<D = unknown, M = unknown> {
     private canAttemptResume(now = Date.now()): boolean {
         return this.resumeOptions.enabled
             && this.resumeOptions.token !== undefined
+            && this.resumeClient?.isSuspended === true
             && this.resumeDeadlineAt > now;
     }
 
@@ -991,6 +1018,24 @@ export class RSocket<D = unknown, M = unknown> {
             client.close(code, reason);
         } catch (error) {
             this.lastError ??= error;
+        }
+    }
+
+    /** Fails streams retained by a suspended session before opening fresh SETUP. */
+    private abandonResume(error: unknown): void {
+        const client = this.resumeClient;
+        this.resumeClient = undefined;
+        client?.abandonResume(error);
+    }
+
+    /** Generates a token for the next logical session after the previous one ends. */
+    private rotateResumeToken(): void {
+        if (!this.resumeOptions.enabled) return;
+        const token = createResumeToken();
+        this.resumeOptions = {...this.resumeOptions, token};
+        this.clientOptions = withResumeToken(this.clientOptions, token);
+        if (this.validatedClientOptions !== undefined) {
+            this.validatedClientOptions = withResumeToken(this.validatedClientOptions, token);
         }
     }
 
@@ -1239,7 +1284,33 @@ function normalizeFacadeRequestOptions(options: RSocketRequestOptions | null | u
  * Detects a responder ERROR frame that explicitly rejects protocol Resume.
  */
 function isRejectedResume(error: unknown): boolean {
+    return hasErrorCode(error, FrameErrorCode.REJECTED_RESUME);
+}
+
+/** Checks protocol-aware errors without coupling reconnect to internal classes. */
+function hasErrorCode(error: unknown, code: FrameErrorCode): boolean {
     return typeof error === "object" &&
         error !== null &&
-        (error as { readonly code?: unknown }).code === FrameErrorCode.REJECTED_RESUME;
+        (error as { readonly code?: unknown }).code === code;
+}
+
+/** Replaces a generated Resume token in raw and already normalized client options. */
+function withResumeToken<D, M>(
+    options: RSocketClientOptions<D, M>,
+    token: string | undefined
+): RSocketClientOptions<D, M> {
+    if (token === undefined) return options;
+    const prepared = options as PreparedRSocketClientOptions<D, M>;
+    const next = {
+        ...options,
+        setup: {...options.setup, resumeToken: token}
+    };
+    if (prepared.normalizedOptions === undefined) return next;
+    return {
+        ...next,
+        normalizedOptions: {
+            ...prepared.normalizedOptions,
+            setup: {...prepared.normalizedOptions.setup, resumeToken: token}
+        }
+    } as PreparedRSocketClientOptions<D, M>;
 }

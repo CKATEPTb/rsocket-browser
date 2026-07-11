@@ -9,6 +9,7 @@ import {AsyncQueue} from "@/async/index.js";
 import {decodeFramePayload, errorPayload} from "@/payload/index.js";
 import type {RSocketPayloadFrame} from "@/types/index.js";
 import {errorFromFrame, RSocketProtocolError} from "@/errors/index.js";
+import {addReactiveDemand, normalizeReactiveDemand} from "@/stream/demand.js";
 
 /** No-op subscription used when stream setup fails before a real subscription exists. */
 const EMPTY_SUBSCRIPTION: Subscription = Object.freeze({
@@ -45,6 +46,9 @@ function hasAfterSubscribe(subscription: Subscription): subscription is AfterSub
 export interface StreamSession {
     /** Sends a frame through the active requester session. */
     sendFrame(frame: Frame): void;
+
+    /** Sends an initial REQUEST frame while consuming one requester lease credit. */
+    sendRequestFrame(frame: Frame): void;
 
     /** Removes a stream controller and any stored fragments. */
     unregisterStream(streamId: number): void;
@@ -248,19 +252,33 @@ export class RSocketStreamSubscription implements Subscription, StreamController
     private started = false;
     private cancelled = false;
     private responseTerminated = false;
+    /** Suppresses demand re-entered from the NEXT callback of a final payload. */
+    private completing = false;
     private outboundTerminated = true;
     private requested = 0;
-    private outbound?: OutboundChannel;
+    /** Response credits currently granted to the peer but not yet consumed. */
+    private wireRequested = 0;
+    private outbound: OutboundChannel | undefined;
+    private disposed = false;
+    private session: StreamSession | undefined;
+    private allocateStreamId: (() => number) | undefined;
+    private startStream: StartStream | undefined;
+    /** Downstream callbacks released as soon as this subscription terminates. */
+    private subscriber: Subscriber<RSocketPayloadFrame> | undefined;
 
     /**
      * Creates a stream subscription for a specific client stream id.
      */
     constructor(
-        private readonly session: StreamSession,
-        private readonly subscriber: Subscriber<RSocketPayloadFrame>,
-        private readonly allocateStreamId: () => number,
-        private readonly startStream: StartStream
+        session: StreamSession,
+        subscriber: Subscriber<RSocketPayloadFrame>,
+        allocateStreamId: () => number,
+        startStream: StartStream
     ) {
+        this.session = session;
+        this.subscriber = subscriber;
+        this.allocateStreamId = allocateStreamId;
+        this.startStream = startStream;
     }
 
     /**
@@ -282,6 +300,7 @@ export class RSocketStreamSubscription implements Subscription, StreamController
      * Marks request-channel outbound publishing complete.
      */
     markOutboundComplete(): void {
+        this.outbound = undefined;
         this.outboundTerminated = true;
         this.disposeIfDone();
     }
@@ -290,29 +309,13 @@ export class RSocketStreamSubscription implements Subscription, StreamController
      * Requests more response payloads from the responder.
      */
     request(n: number): void {
-        if (this.cancelled || this.responseTerminated) return;
+        if (this.cancelled || this.responseTerminated || this.completing) return;
 
         try {
-            if (n === Number.POSITIVE_INFINITY) {
-                this.requestChunk(MAX_REQUEST_N);
-                return;
-            }
-            if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > Number.MAX_SAFE_INTEGER) {
-                throw new RangeError("Reactive Streams request(n) expects a strictly positive integer");
-            }
-            if (n <= MAX_REQUEST_N) {
-                this.requestChunk(n);
-                return;
-            }
-
-            let remaining = n;
-            while (remaining > 0) {
-                const chunk = Math.min(remaining, MAX_REQUEST_N);
-                this.requestChunk(chunk);
-                remaining -= chunk;
-            }
+            this.requested = addReactiveDemand(this.requested, normalizeReactiveDemand(n));
+            this.requestDemand();
         } catch (error) {
-            this.fail(error);
+            this.failInvalidDemand(error);
         }
     }
 
@@ -322,10 +325,13 @@ export class RSocketStreamSubscription implements Subscription, StreamController
     cancel(): void {
         if (this.cancelled || (this.responseTerminated && this.outboundTerminated)) return;
         this.cancelled = true;
-        this.outbound?.abort();
+        this.subscriber = undefined;
+        const outbound = this.outbound;
+        this.outbound = undefined;
+        outbound?.abort();
         if (this.started) {
             try {
-                this.session.sendFrame(new CancelFrame(this.streamId));
+                this.session?.sendFrame(new CancelFrame(this.streamId));
             } catch {
                 // The stream is already locally cancelled; a closed socket cannot observe CANCEL.
             }
@@ -346,9 +352,10 @@ export class RSocketStreamSubscription implements Subscription, StreamController
             return;
         }
 
+        this.completing = isComplete;
         if (isNext) {
-            if (this.requested <= 0) {
-                this.session.protocolError(
+            if (this.requested <= 0 || this.wireRequested <= 0) {
+                this.session?.protocolError(
                     new RSocketProtocolError("Responder sent PAYLOAD without requester demand", {
                         code: FrameErrorCode.CONNECTION_ERROR,
                         streamId: this.streamId
@@ -357,20 +364,32 @@ export class RSocketStreamSubscription implements Subscription, StreamController
                 return;
             }
             if (this.requested !== Number.POSITIVE_INFINITY) this.requested -= 1;
+            this.wireRequested -= 1;
 
+            const subscriber = this.subscriber;
+            if (subscriber === undefined) return;
             try {
-                this.subscriber.onNext(decodeFramePayload(frame));
+                subscriber.onNext(decodeFramePayload(frame));
             } catch (error) {
                 this.cancel();
-                this.signalError(error);
+                signalSubscriberError(subscriber, error);
                 return;
             }
             if (this.cancelled || this.responseTerminated) return;
         }
 
         if (isComplete) {
+            this.completing = false;
             this.completeResponse();
             return;
+        }
+
+        if (isNext) {
+            try {
+                this.replenishDemand();
+            } catch (error) {
+                this.fail(error);
+            }
         }
 
         // Frames without NEXT or COMPLETE do not alter the stream sequence.
@@ -392,7 +411,7 @@ export class RSocketStreamSubscription implements Subscription, StreamController
         }
 
         if (!Number.isInteger(frame.request) || frame.request <= 0 || frame.request > MAX_REQUEST_N) {
-            this.session.protocolError(
+            this.session?.protocolError(
                 new RSocketProtocolError("Responder sent invalid REQUEST_N", {
                     code: FrameErrorCode.CONNECTION_ERROR,
                     streamId: this.streamId
@@ -417,59 +436,87 @@ export class RSocketStreamSubscription implements Subscription, StreamController
     fail(error: unknown): void {
         if (this.cancelled) return;
         const shouldSignal = !this.responseTerminated;
+        const subscriber = shouldSignal ? this.subscriber : undefined;
+        this.subscriber = undefined;
         this.cancelled = true;
-        this.outbound?.abort(error);
+        const outbound = this.outbound;
+        this.outbound = undefined;
+        outbound?.abort(error);
         this.dispose();
-        if (shouldSignal) this.signalError(error);
+        if (subscriber !== undefined) signalSubscriberError(subscriber, error);
     }
 
     /**
-     * Fails the outbound half of request-channel and sends APPLICATION_ERROR.
+     * Fails request-channel locally and notifies the peer when its initial
+     * REQUEST_CHANNEL was already sent.
      */
-    failOutbound(error: unknown): void {
+    failOutbound(error: unknown, notifyPeer = true): void {
         if (this.cancelled) return;
+        const subscriber = this.responseTerminated ? undefined : this.subscriber;
+        this.subscriber = undefined;
         this.cancelled = true;
+        this.outbound = undefined;
         this.outboundTerminated = true;
-        if (this.started) {
+        if (notifyPeer && this.started) {
             try {
-                this.session.sendFrame(new ErrorFrame(this.streamId, FrameErrorCode.APPLICATION_ERROR, errorPayload(error)));
+                this.session?.sendFrame(new ErrorFrame(this.streamId, FrameErrorCode.APPLICATION_ERROR, errorPayload(error)));
             } catch {
                 // The subscriber still needs the local failure even if the socket is closed.
             }
         }
         this.dispose();
-        if (!this.responseTerminated) this.signalError(error);
+        if (subscriber !== undefined) signalSubscriberError(subscriber, error);
     }
 
-    /**
-     * Sends REQUEST_N after the initial stream frame has already been sent.
-     */
-    private sendRequestN(n: number): void {
-        this.addRequested(n);
-        this.session.sendFrame(new RequestNFrame(this.streamId, n));
-    }
-
-    /**
-     * Starts the stream on the first request or sends additional REQUEST_N chunks.
-     */
-    private requestChunk(chunk: number): void {
+    /** Starts the stream or grants currently available downstream demand. */
+    private requestDemand(): void {
         if (!this.started) {
-            this.assignedStreamId = this.allocateStreamId();
+            const allocateStreamId = this.allocateStreamId;
+            const startStream = this.startStream;
+            if (allocateStreamId === undefined || startStream === undefined) return;
+            this.assignedStreamId = allocateStreamId();
             this.started = true;
-            this.addRequested(chunk);
-            this.startStream(this.streamId, chunk, this);
+            this.allocateStreamId = undefined;
+            this.startStream = undefined;
+            const initialRequestN = Math.min(this.requested, MAX_REQUEST_N);
+            this.wireRequested = initialRequestN;
+            startStream(this.streamId, initialRequestN, this);
             return;
         }
 
-        this.sendRequestN(chunk);
+        this.grantAvailableDemand();
     }
 
-    /**
-     * Tracks local demand and clamps it to a safe JavaScript integer.
-     */
-    private addRequested(n: number): void {
-        if (this.requested === Number.POSITIVE_INFINITY) return;
-        this.requested = n >= Number.MAX_SAFE_INTEGER - this.requested ? Number.MAX_SAFE_INTEGER : this.requested + n;
+    /** Grants at most one full protocol window without emitting millions of frames. */
+    private grantAvailableDemand(): void {
+        const session = this.session;
+        if (session === undefined) return;
+        const grant = Math.min(this.requested, MAX_REQUEST_N) - this.wireRequested;
+        if (grant <= 0) return;
+        this.wireRequested += grant;
+        try {
+            session.sendFrame(new RequestNFrame(this.streamId, grant));
+        } catch (error) {
+            this.wireRequested -= grant;
+            throw error;
+        }
+    }
+
+    /** Refills a large demand window only after half of its credits were consumed. */
+    private replenishDemand(): void {
+        if (this.wireRequested <= (MAX_REQUEST_N >>> 1)) this.grantAvailableDemand();
+    }
+
+    /** Terminates invalid demand and cancels a stream already known to the peer. */
+    private failInvalidDemand(error: unknown): void {
+        if (this.started) {
+            try {
+                this.session?.sendFrame(new CancelFrame(this.streamId));
+            } catch {
+                // Local termination still has to notify the subscriber when the transport is unavailable.
+            }
+        }
+        this.fail(error);
     }
 
     /**
@@ -478,23 +525,14 @@ export class RSocketStreamSubscription implements Subscription, StreamController
     private completeResponse(): void {
         if (this.responseTerminated) return;
         this.responseTerminated = true;
+        const subscriber = this.subscriber;
+        this.subscriber = undefined;
         try {
-            this.subscriber.onComplete();
+            subscriber?.onComplete();
         } catch {
             // Subscriber terminal callbacks must not turn a completed stream into a protocol failure.
         } finally {
             this.disposeIfDone();
-        }
-    }
-
-    /**
-     * Delivers an error to the subscriber without allowing user code to break session dispatch.
-     */
-    private signalError(error: unknown): void {
-        try {
-            this.subscriber.onError(error);
-        } catch {
-            // Subscriber terminal callbacks are user code; the stream is already terminal.
         }
     }
 
@@ -509,6 +547,23 @@ export class RSocketStreamSubscription implements Subscription, StreamController
      * Removes this stream from the owning session.
      */
     private dispose(): void {
-        if (this.assignedStreamId !== undefined) this.session.unregisterStream(this.assignedStreamId);
+        if (this.disposed) return;
+        this.disposed = true;
+        const session = this.session;
+        this.session = undefined;
+        this.allocateStreamId = undefined;
+        this.startStream = undefined;
+        this.outbound = undefined;
+        this.subscriber = undefined;
+        if (this.assignedStreamId !== undefined) session?.unregisterStream(this.assignedStreamId);
+    }
+}
+
+/** Delivers a terminal error without allowing user code to escape dispatch. */
+function signalSubscriberError(subscriber: Subscriber<RSocketPayloadFrame>, error: unknown): void {
+    try {
+        subscriber.onError(error);
+    } catch {
+        // Subscriber terminal callbacks are user code; the stream is already terminal.
     }
 }
