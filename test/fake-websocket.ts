@@ -25,6 +25,10 @@ export class FakeWebSocket implements RSocketWebSocket {
   bufferedAmount = 0;
   /** Current fake WebSocket ready state. */
   readyState = WS_CONNECTING;
+  /** Last close code supplied by the client. */
+  closeCode: number | undefined;
+  /** Last close reason supplied by the client. */
+  closeReason: string | undefined;
   /** Raw frames sent by the RSocket requester. */
   readonly sent: Uint8Array[] = [];
   /** Optional hook invoked after every successful send. */
@@ -46,6 +50,8 @@ export class FakeWebSocket implements RSocketWebSocket {
    */
   close(code?: number, reason?: string): void {
     if (this.readyState === WS_CLOSED) return;
+    this.closeCode = code;
+    this.closeReason = reason;
     this.readyState = WS_CLOSED;
     this.dispatch("close", { code, reason });
   }

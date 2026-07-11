@@ -14,7 +14,9 @@ import {
   Header,
   KeepaliveFlag,
   KeepaliveFrame,
+  LeaseFrame,
   Metadata,
+  MimeType,
   MetadataPushFrame,
   Payload,
   PayloadFlag,
@@ -30,8 +32,7 @@ import {
   SetupFrame,
   WellKnownAuthType,
   WellKnownMimeType,
-  type Frame,
-  type MimeType
+  type Frame
 } from "rsocket-frames-ts";
 import {
   FireAndForgetController,
@@ -42,6 +43,7 @@ import {
 } from "@";
 import { browserReconnectSignals } from "@/reconnect/index.js";
 import { normalizeResumeOptions } from "@/resume/index.js";
+import { receiveResumeOkFrame } from "@/client/handshake.js";
 import { RSocketFlux } from "@/stream/index.js";
 import { emitOutboundFrameFragments, outboundFrameLength } from "@/fragmentation/index.js";
 import { ReactiveWebSocketConnection, WS_CLOSED, webSocketMessageBytes } from "@/transport/websocket/index.js";
@@ -147,6 +149,29 @@ describe("RSocket", () => {
     }
   });
 
+  it("does not wait for an online event before the initial connection attempt", async () => {
+    const browser = installBrowserSignals(false);
+    const sockets: FakeWebSocket[] = [];
+
+    try {
+      const client = new RSocket("ws://localhost/rsocket", {
+        setup: setupOptions(20_000, 90_000, () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        }),
+        reconnect: false
+      });
+      const ready = client.connect().block();
+
+      expect(sockets).toHaveLength(1);
+      sockets[0]?.close(1006, "offline");
+      await expect(ready).rejects.toThrow("closed before it opened");
+    } finally {
+      browser.restore();
+    }
+  });
+
   it("removes WebSocket message listeners after binary conversion failures", async () => {
     const socket = new FakeWebSocket();
     const errors: unknown[] = [];
@@ -218,6 +243,30 @@ describe("RSocket", () => {
 
     await expect(client.connect().block()).rejects.toThrow("maxFrameLength");
     expect(sockets).toHaveLength(0);
+  });
+
+  it("consumes LEASE credit only after an initial request is ready to send", async () => {
+    class ThrowingMimeType extends MimeType<unknown> {
+      /** Simulates an application codec failure before a frame reaches the transport. */
+      protected override serializePayload(_payload: unknown): Payload<unknown> {
+        throw new Error("codec failed");
+      }
+    }
+
+    const { client, socket } = await connect({ lease: true });
+    await expect(client.fireAndForget({ denied: true }).block()).rejects.toThrow("No active RSocket lease");
+
+    socket.serverSend(new LeaseFrame(10_000, 1));
+    await flush();
+
+    await expect(
+      client.fireAndForget({ invalid: true }, undefined, { data: new ThrowingMimeType("application/x-test-failure") }).block()
+    ).rejects.toThrow("codec failed");
+    await expect(client.fireAndForget({ accepted: true }).block()).resolves.toBeUndefined();
+    await expect(client.fireAndForget({ exhausted: true }).block()).rejects.toThrow("No active RSocket lease");
+
+    expect(socket.sent).toHaveLength(2);
+    expect(socket.decodeSent(1, metadataMimeType, dataMimeType)).toBeInstanceOf(RequestFireAndForgetFrame);
   });
 
   it("rejects maxFrameLength values above the RSocket 24-bit frame limit", async () => {
@@ -1338,6 +1387,22 @@ describe("RSocket", () => {
     await expect(response).resolves.toEqual({ name: "Ada" });
   });
 
+  it("rejects empty or oversized controller routing tags before sending a request", async () => {
+    class EmptyRouteController extends FireAndForgetController<void> {
+      /** Invalid empty routing tag used by this regression test. */
+      protected readonly route = "";
+    }
+    class OversizedRouteController extends FireAndForgetController<void> {
+      /** Two-byte UTF-8 characters make this tag exceed the one-byte routing length. */
+      protected readonly route = "é".repeat(128);
+    }
+    const { client, socket } = await connect();
+
+    expect(() => client.process(EmptyRouteController)).toThrow("non-empty");
+    expect(() => client.process(OversizedRouteController)).toThrow("255 UTF-8 bytes");
+    expect(socket.sent).toHaveLength(1);
+  });
+
   it("processes Spring-style class controllers with typed request and response bodies", async () => {
     /**
      * Request body accepted by the password-change route.
@@ -2054,7 +2119,35 @@ describe("RSocket", () => {
     expect(cancel.header.streamId).toBe(request.header.streamId);
   });
 
-  it("chunks large Reactive Streams demand into protocol-sized REQUEST_N frames", async () => {
+  it("cancels an already-started stream when downstream demand is invalid", async () => {
+    const { client, socket } = await connect({ autoReconnect: false });
+    const errors: unknown[] = [];
+    let subscription: Subscription | undefined;
+
+    client.requestStream({ route: "invalid-demand" }).subscribe({
+      onSubscribe(nextSubscription) {
+        subscription = nextSubscription;
+      },
+      onNext() {},
+      onError(error) {
+        errors.push(error);
+      },
+      onComplete() {}
+    });
+
+    subscription?.request(1);
+    const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestStreamFrame;
+    subscription?.request(0);
+    await waitFor(() => errors.length === 1);
+
+    const cancel = socket.decodeSent(2, metadataMimeType, dataMimeType) as CancelFrame;
+    expect(cancel).toBeInstanceOf(CancelFrame);
+    expect(cancel.header.streamId).toBe(request.header.streamId);
+    expect(errors[0]).toBeInstanceOf(RangeError);
+    expect(socket.readyState).not.toBe(WS_CLOSED);
+  });
+
+  it("bounds huge Reactive Streams demand to one replenished protocol window", async () => {
     const { client, socket } = await connect();
     let subscription: Subscription | undefined;
 
@@ -2069,12 +2162,62 @@ describe("RSocket", () => {
       onComplete() {}
     });
 
-    subscription?.request(0x80000000);
+    subscription?.request(Number.MAX_SAFE_INTEGER);
 
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestStreamFrame;
-    const requestN = socket.decodeSent(2, metadataMimeType, dataMimeType) as RequestNFrame;
     expect(request.request).toBe(0x7fffffff);
-    expect(requestN.request).toBe(1);
+    expect(socket.sent).toHaveLength(2);
+
+    // Reach the low-water mark without allocating or dispatching a billion test payloads.
+    const internal = subscription as unknown as { wireRequested: number };
+    internal.wireRequested = 0x3fffffff;
+    socket.serverSend(
+      new PayloadFrame(
+        request.header.streamId,
+        PayloadFlag.NEXT,
+        undefined,
+        dataMimeType.toPayload({ n: 1 })
+      )
+    );
+    await flush();
+
+    const requestN = socket.decodeSent(2, metadataMimeType, dataMimeType) as RequestNFrame;
+    expect(requestN.request).toBe(0x40000001);
+  });
+
+  it("does not send reentrant demand after a final NEXT and COMPLETE payload", async () => {
+    const { client, socket } = await connect();
+    let subscription: Subscription | undefined;
+    let completed = false;
+
+    client.requestStream({ route: "final" }).subscribe({
+      onSubscribe(nextSubscription) {
+        subscription = nextSubscription;
+      },
+      onNext() {
+        subscription?.request(1);
+      },
+      onError(error) {
+        throw error;
+      },
+      onComplete() {
+        completed = true;
+      }
+    });
+
+    subscription?.request(1);
+    const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestStreamFrame;
+    socket.serverSend(
+      new PayloadFrame(
+        request.header.streamId,
+        PayloadFlag.combine(PayloadFlag.NEXT, PayloadFlag.COMPLETE),
+        undefined,
+        dataMimeType.toPayload({ done: true })
+      )
+    );
+    await waitFor(() => completed);
+
+    expect(socket.sent).toHaveLength(2);
   });
 
   it("propagates stream ERROR frames through the response publisher", async () => {
@@ -2410,6 +2553,19 @@ describe("RSocket", () => {
     }
   });
 
+  it("closes on connection-only frames carried by a non-zero stream", async () => {
+    const { socket } = await connect({ autoReconnect: false });
+    const bytes = new MetadataPushFrame(WellKnownMimeType.TEXT_PLAIN.toMetadata("invalid")).toUint8Array().slice();
+    bytes[3] = 1;
+
+    socket.dispatchMessage(bytes);
+    await waitFor(() => socket.readyState === WS_CLOSED);
+
+    const error = socket.decodeSent(1, metadataMimeType, dataMimeType) as ErrorFrame;
+    expect(error).toBeInstanceOf(ErrorFrame);
+    expect(error.code).toBe(FrameErrorCode.CONNECTION_ERROR);
+  });
+
   it("ignores setup and resume rejection errors after setup completed", async () => {
     for (const code of [
       FrameErrorCode.INVALID_SETUP,
@@ -2435,6 +2591,57 @@ describe("RSocket", () => {
 
       expect(socket.readyState).not.toBe(WS_CLOSED);
       expect(socket.sent).toHaveLength(2);
+    }
+  });
+
+  it("lets active streams finish after responder CONNECTION_CLOSE", async () => {
+    const { client, socket } = await connect({ autoReconnect: false });
+    const response = client.requestResponse({ slow: true }).block();
+    const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
+
+    socket.serverSend(
+      new ErrorFrame(
+        0,
+        FrameErrorCode.CONNECTION_CLOSE,
+        WellKnownMimeType.TEXT_PLAIN.toPayload("server draining")
+      )
+    );
+    await flush();
+
+    expect(socket.readyState).not.toBe(WS_CLOSED);
+    await expect(client.fireAndForget({ rejected: true }).block()).rejects.toThrow(
+      "responder is closing"
+    );
+
+    socket.serverSend(
+      new PayloadFrame(
+        request.header.streamId,
+        PayloadFlag.combine(PayloadFlag.NEXT, PayloadFlag.COMPLETE),
+        undefined,
+        dataMimeType.toPayload({ ok: true })
+      )
+    );
+
+    await expect(response).resolves.toMatchObject({ data: { ok: true } });
+    await waitFor(() => socket.readyState === WS_CLOSED);
+    expect(socket.closeCode).toBe(1000);
+  });
+
+  it("closes on ERROR codes carried by an invalid stream ID", async () => {
+    for (const frame of [
+      new ErrorFrame(0, FrameErrorCode.APPLICATION_ERROR, WellKnownMimeType.TEXT_PLAIN.toPayload("bad stream")),
+      new ErrorFrame(1, FrameErrorCode.CONNECTION_ERROR, WellKnownMimeType.TEXT_PLAIN.toPayload("bad stream"))
+    ]) {
+      const { socket } = await connect({ autoReconnect: false });
+
+      socket.serverSend(frame);
+      await waitFor(() => socket.readyState === WS_CLOSED);
+
+      const error = socket.decodeSent(1, metadataMimeType, dataMimeType) as ErrorFrame;
+      expect(error).toBeInstanceOf(ErrorFrame);
+      expect(error.header.streamId).toBe(0);
+      expect(error.code).toBe(FrameErrorCode.CONNECTION_ERROR);
+      expect(socket.closeCode).toBe(3002);
     }
   });
 
@@ -2464,6 +2671,44 @@ describe("RSocket", () => {
 
     expect(socket.readyState).not.toBe(WS_CLOSED);
     expect(((client as any).client as { fragments: Map<number, unknown> }).fragments.size).toBe(0);
+  });
+
+  it("does not invoke application codecs for PAYLOAD frames on unknown streams", async () => {
+    class ThrowingDecodeMimeType extends MimeType<unknown> {
+      /** Makes accidental application-level decoding observable. */
+      protected override deserializePayload(): Payload<unknown> {
+        throw new Error("application decoder must not run");
+      }
+    }
+
+    const socket = new FakeWebSocket();
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: {
+        ...setupOptions(20_000, 90_000, fakeWebSocketFactory(socket)),
+        mimetype: {
+          data: new ThrowingDecodeMimeType("application/x-throwing-decoder"),
+          metadata: metadataMimeType
+        }
+      },
+      reconnect: false
+    });
+    const ready = client.connect().block();
+    socket.open();
+    const connected = (await ready)!;
+
+    socket.serverSend(
+      new PayloadFrame(
+        99,
+        PayloadFlag.NEXT,
+        undefined,
+        WellKnownMimeType.APPLICATION_OCTET_STREAM.toPayload(new Uint8Array([1]))
+      )
+    );
+    await flush();
+
+    expect(socket.readyState).not.toBe(WS_CLOSED);
+    expect(socket.sent).toHaveLength(1);
+    connected.disconnect();
   });
 
   it("echoes KEEPALIVE payloads when RESPOND is set", async () => {
@@ -2579,7 +2824,298 @@ describe("RSocket", () => {
     expect(sockets[1]?.sent).toHaveLength(1);
   });
 
-  it("keeps retrying protocol resume after a resume transport failure", async () => {
+  it("keeps an active request stream and queued demand across successful Resume", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const values: unknown[] = [];
+    const errors: unknown[] = [];
+    let completed = false;
+    let subscription: Subscription | undefined;
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: setupOptions(20_000, 90_000, () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      }),
+      reconnect: fastReconnect({ resume: { ttl: 10_000 } })
+    });
+    const ready = client.connect().block();
+    sockets[0]?.open();
+    const connected = (await ready)!;
+
+    try {
+      client.requestStream({ route: "resume-stream" }).subscribe({
+        onSubscribe(nextSubscription) {
+          subscription = nextSubscription;
+        },
+        onNext(payload) {
+          values.push(payload.data);
+        },
+        onError(error) {
+          errors.push(error);
+        },
+        onComplete() {
+          completed = true;
+        }
+      });
+      subscription?.request(1);
+
+      const requestBytes = BigInt(sockets[0]?.sent[1]?.byteLength ?? 0);
+      const request = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestStreamFrame;
+      sockets[0]?.serverSend(
+        new PayloadFrame(
+          request.header.streamId,
+          PayloadFlag.NEXT,
+          undefined,
+          dataMimeType.toPayload({ value: 1 })
+        )
+      );
+      await waitFor(() => values.length === 1);
+
+      sockets[0]?.close(1006, "network lost");
+      subscription?.request(1);
+      await waitFor(() => sockets.length === 2);
+      sockets[1]?.open();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 1);
+
+      const resume = sockets[1]?.decodeSent(0, metadataMimeType, dataMimeType) as ResumeFrame;
+      expect(resume.firstAvailableClientPosition).toBe(0n);
+      sockets[1]?.serverSend(new ResumeOkFrame(requestBytes));
+      await client.connect().block();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 2);
+
+      const queuedDemand = sockets[1]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestNFrame;
+      expect(queuedDemand).toBeInstanceOf(RequestNFrame);
+      expect(queuedDemand.header.streamId).toBe(request.header.streamId);
+      expect(queuedDemand.request).toBe(1);
+
+      sockets[1]?.serverSend(
+        new PayloadFrame(
+          request.header.streamId,
+          PayloadFlag.combine(PayloadFlag.NEXT, PayloadFlag.COMPLETE),
+          undefined,
+          dataMimeType.toPayload({ value: 2 })
+        )
+      );
+      await waitFor(() => completed);
+
+      expect(values).toEqual([{ value: 1 }, { value: 2 }]);
+      expect(errors).toHaveLength(0);
+    } finally {
+      connected.disconnect();
+    }
+  });
+
+  it("keeps both request-channel directions and their backpressure across Resume", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: setupOptions(20_000, 90_000, () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      }),
+      reconnect: fastReconnect({ resume: { ttl: 10_000 } })
+    });
+    const ready = client.connect().block();
+    sockets[0]?.open();
+    const connected = (await ready)!;
+    const channel = client.requestChannel<{ value: string }>();
+    const values: unknown[] = [];
+    const errors: unknown[] = [];
+    let responseSubscription: Subscription | undefined;
+    let completed = false;
+
+    try {
+      channel.subscribe({
+        onSubscribe(subscription) {
+          responseSubscription = subscription;
+        },
+        onNext(value) {
+          values.push(value.data);
+        },
+        onError(error) {
+          errors.push(error);
+        },
+        onComplete() {
+          completed = true;
+        }
+      });
+      responseSubscription?.request(1);
+      channel.next({ data: { value: "a" } });
+      await waitFor(() => (sockets[0]?.sent.length ?? 0) === 2);
+
+      const initial = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestChannelFrame;
+      expect(initial).toBeInstanceOf(RequestChannelFrame);
+      sockets[0]?.serverSend(new RequestNFrame(initial.header.streamId, 1));
+      channel.next({ data: { value: "b" } });
+      await waitFor(() => (sockets[0]?.sent.length ?? 0) === 3);
+
+      const acknowledged = BigInt(
+        (sockets[0]?.sent.slice(1) ?? []).reduce((length, bytes) => length + bytes.byteLength, 0)
+      );
+      sockets[0]?.serverSend(new KeepaliveFrame(KeepaliveFlag.NONE, acknowledged));
+      await flush();
+      sockets[0]?.close(1006, "network lost");
+      await waitFor(() => sockets.length === 2);
+
+      responseSubscription?.request(1);
+      channel.next({ data: { value: "c" } });
+      sockets[1]?.open();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 1);
+      const resume = sockets[1]?.decodeSent(0, metadataMimeType, dataMimeType) as ResumeFrame;
+      expect(resume.firstAvailableClientPosition).toBe(acknowledged);
+      sockets[1]?.serverSend(new ResumeOkFrame(acknowledged));
+      await client.connect().block();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 2);
+
+      const queuedResponseDemand = sockets[1]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestNFrame;
+      expect(queuedResponseDemand.header.streamId).toBe(initial.header.streamId);
+      expect(queuedResponseDemand.request).toBe(1);
+
+      sockets[1]?.serverSend(new RequestNFrame(initial.header.streamId, 1));
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 3);
+      const resumedOutbound = sockets[1]?.decodeSent(2, metadataMimeType, dataMimeType) as PayloadFrame;
+      expect(resumedOutbound.header.streamId).toBe(initial.header.streamId);
+      expect((resumedOutbound as any).payload).toEqual({ value: "c" });
+
+      channel.complete();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 4);
+      const outboundComplete = sockets[1]?.decodeSent(3, metadataMimeType, dataMimeType) as PayloadFrame;
+      expect(outboundComplete.isComplete()).toBe(true);
+
+      sockets[1]?.serverSend(
+        new PayloadFrame(
+          initial.header.streamId,
+          PayloadFlag.combine(PayloadFlag.NEXT, PayloadFlag.COMPLETE),
+          undefined,
+          dataMimeType.toPayload({ accepted: true })
+        )
+      );
+      await waitFor(() => completed);
+
+      expect(values).toEqual([{ accepted: true }]);
+      expect(errors).toHaveLength(0);
+    } finally {
+      connected.disconnect();
+    }
+  });
+
+  it("replays an unacknowledged request-response frame after RESUME_OK", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: setupOptions(20_000, 90_000, () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      }),
+      reconnect: fastReconnect({ resume: { ttl: 10_000 } })
+    });
+    const ready = client.connect().block();
+    sockets[0]?.open();
+    const connected = (await ready)!;
+
+    try {
+      if (sockets[0] !== undefined) {
+        sockets[0].onSend = () => {
+          if (sockets[0]?.sent.length === 3) sockets[0]?.close(1006, "network lost during send");
+        };
+      }
+      const response = client.requestResponse({ value: "replay" }).block();
+      const request = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
+      await client.fireAndForget({ value: "also-replay" }).block();
+      const requestPosition = BigInt(
+        (sockets[0]?.sent.slice(1) ?? []).reduce((length, bytes) => length + bytes.byteLength, 0)
+      );
+
+      await waitFor(() => sockets.length === 2);
+      sockets[1]?.open();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 1);
+
+      const resume = sockets[1]?.decodeSent(0, metadataMimeType, dataMimeType) as ResumeFrame;
+      expect(resume.firstAvailableClientPosition).toBe(0n);
+      if (sockets[1] !== undefined) {
+        sockets[1].onSend = () => {
+          if (sockets[1]?.sent.length === 2) {
+            sockets[1]?.serverSend(new KeepaliveFrame(KeepaliveFlag.NONE, requestPosition));
+          }
+        };
+      }
+      sockets[1]?.serverSend(new ResumeOkFrame(0n));
+      await client.connect().block();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 3);
+
+      const replay = sockets[1]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
+      expect(replay).toBeInstanceOf(RequestResponseFrame);
+      expect(replay.header.streamId).toBe(request.header.streamId);
+      expect((replay as any).payload).toEqual({ value: "replay" });
+      const replayedFnf = sockets[1]?.decodeSent(2, metadataMimeType, dataMimeType) as RequestFireAndForgetFrame;
+      expect(replayedFnf).toBeInstanceOf(RequestFireAndForgetFrame);
+      expect((replayedFnf as any).payload).toEqual({ value: "also-replay" });
+
+      sockets[1]?.serverSend(
+        new PayloadFrame(
+          replay.header.streamId,
+          PayloadFlag.combine(PayloadFlag.NEXT, PayloadFlag.COMPLETE),
+          undefined,
+          dataMimeType.toPayload({ replayed: true })
+        )
+      );
+      await expect(response).resolves.toMatchObject({ data: { replayed: true } });
+    } finally {
+      connected.disconnect();
+    }
+  });
+
+  it("replays every fragment of an oversized request byte-for-byte after Resume", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: setupOptions(20_000, 90_000, () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      }),
+      reconnect: fastReconnect({ resume: { ttl: 10_000 } }),
+      ...({ maxFrameLength: 256 } as any)
+    });
+    const ready = client.connect().block();
+    sockets[0]?.open();
+    const connected = (await ready)!;
+
+    try {
+      const response = client.requestResponse({ value: "x".repeat(1_024) }).block();
+      const originalFragments = (sockets[0]?.sent.slice(1) ?? []).map((bytes) => bytes.slice());
+      expect(originalFragments.length).toBeGreaterThan(1);
+      expect(originalFragments.every((bytes) => bytes.byteLength <= 256)).toBe(true);
+      const request = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
+      expect(request).toBeInstanceOf(RequestResponseFrame);
+      expect(hasFollows(request)).toBe(true);
+
+      sockets[0]?.close(1006, "network lost");
+      await waitFor(() => sockets.length === 2);
+      sockets[1]?.open();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 1);
+      sockets[1]?.serverSend(new ResumeOkFrame(0n));
+      await client.connect().block();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === originalFragments.length + 1);
+
+      for (let index = 0; index < originalFragments.length; index += 1) {
+        expect(Array.from(sockets[1]?.sent[index + 1] ?? [])).toEqual(Array.from(originalFragments[index] ?? []));
+      }
+
+      sockets[1]?.serverSend(
+        new PayloadFrame(
+          request.header.streamId,
+          PayloadFlag.combine(PayloadFlag.NEXT, PayloadFlag.COMPLETE),
+          undefined,
+          dataMimeType.toPayload({ ok: true })
+        )
+      );
+      await expect(response).resolves.toMatchObject({ data: { ok: true } });
+    } finally {
+      connected.disconnect();
+    }
+  });
+
+  it("keeps retrying Resume after transport and responder connection errors", async () => {
     const sockets: FakeWebSocket[] = [];
     const client = new RSocket("ws://localhost/rsocket", {
       setup: setupOptions(20_000, 90_000, () => {
@@ -2611,8 +3147,23 @@ describe("RSocket", () => {
     expect(resume).toBeInstanceOf(ResumeFrame);
     expect(resume.resumeToken).toBe(setup.resumeToken);
 
-    sockets[2]?.serverSend(new ResumeOkFrame(resume.firstAvailableClientPosition));
-    await client.connect().block();
+    sockets[2]?.serverSend(
+      new ErrorFrame(
+        0,
+        FrameErrorCode.CONNECTION_ERROR,
+        WellKnownMimeType.TEXT_PLAIN.toPayload("retry this transport")
+      )
+    );
+    await waitFor(() => sockets.length === 4);
+    sockets[3]?.open();
+    await waitFor(() => (sockets[3]?.sent.length ?? 0) === 1);
+
+    const retry = sockets[3]?.decodeSent(0, metadataMimeType, dataMimeType) as ResumeFrame;
+    expect(retry).toBeInstanceOf(ResumeFrame);
+    expect(retry.resumeToken).toBe(setup.resumeToken);
+    sockets[3]?.serverSend(new ResumeOkFrame(retry.firstAvailableClientPosition));
+    const connected = await client.connect().block();
+    connected?.disconnect();
   });
 
   it("counts only resume-tracked frame types in protocol positions", async () => {
@@ -2651,7 +3202,9 @@ describe("RSocket", () => {
     await client
       .metadataPush(WellKnownMimeType.TEXT_PLAIN.toMetadata("connection metadata"))
       .block();
-    sockets[0]?.serverSend(new KeepaliveFrame(KeepaliveFlag.NONE, 0n, dataMimeType.toPayload({ keepalive: true })));
+    sockets[0]?.serverSend(
+      new KeepaliveFrame(KeepaliveFlag.NONE, requestBytes, dataMimeType.toPayload({ keepalive: true }))
+    );
     sockets[0]?.serverSend(new ExtensionFrame(2, ExtensionFlag.IGNORE, 1));
     await flush();
 
@@ -2706,6 +3259,7 @@ describe("RSocket", () => {
     const ready = client.connect().block();
     sockets[0]?.open();
     await ready;
+    const initialSetup = sockets[0]?.decodeSent(0, metadataMimeType, dataMimeType) as SetupFrame;
 
     sockets[0]?.close(1006, "network lost");
     await waitFor(() => sockets.length === 2);
@@ -2725,7 +3279,9 @@ describe("RSocket", () => {
     sockets[2]?.open();
     await waitFor(() => (sockets[2]?.sent.length ?? 0) === 1);
 
-    expect(sockets[2]?.decodeSent(0, metadataMimeType, dataMimeType)).toBeInstanceOf(SetupFrame);
+    const freshSetup = sockets[2]?.decodeSent(0, metadataMimeType, dataMimeType) as SetupFrame;
+    expect(freshSetup).toBeInstanceOf(SetupFrame);
+    expect(freshSetup.resumeToken).not.toBe(initialSetup.resumeToken);
     expect(resumeRejected).toHaveLength(1);
     expect(resumeRejected[0]).toMatchObject({
       type: "resumeRejected",
@@ -2737,7 +3293,58 @@ describe("RSocket", () => {
     });
     expect((resumeRejected[0]?.error as { code?: FrameErrorCode } | undefined)?.code).toBe(FrameErrorCode.REJECTED_RESUME);
     expect(lifecycleTypes).toContain("resumeRejected");
+    const freshConnected = (await client.connect().block())!;
+
+    sockets[2]?.close(1006, "network lost again");
+    await waitFor(() => sockets.length === 4);
+    sockets[3]?.open();
+    await waitFor(() => (sockets[3]?.sent.length ?? 0) === 1);
+    const nextResume = sockets[3]?.decodeSent(0, metadataMimeType, dataMimeType) as ResumeFrame;
+    expect(nextResume.resumeToken).toBe(freshSetup.resumeToken);
+    sockets[3]?.serverSend(new ResumeOkFrame(0n));
     await client.connect().block();
+    freshConnected.disconnect();
+  });
+
+  it("fails retained interactions when Resume is rejected and SETUP starts fresh", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: setupOptions(20_000, 90_000, () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      }),
+      reconnect: fastReconnect({ resume: { ttl: 10_000 } })
+    });
+    const ready = client.connect().block();
+    sockets[0]?.open();
+    const connected = (await ready)!;
+
+    try {
+      const retained = client.requestResponse({ slow: true }).block();
+      expect(sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType)).toBeInstanceOf(RequestResponseFrame);
+
+      sockets[0]?.close(1006, "network lost");
+      await waitFor(() => sockets.length === 2);
+      sockets[1]?.open();
+      await waitFor(() => (sockets[1]?.sent.length ?? 0) === 1);
+      sockets[1]?.serverSend(
+        new ErrorFrame(
+          0,
+          FrameErrorCode.REJECTED_RESUME,
+          WellKnownMimeType.TEXT_PLAIN.toPayload("resume state expired")
+        )
+      );
+
+      await expect(retained).rejects.toThrow("resume state expired");
+      await waitFor(() => sockets.length === 3);
+      sockets[2]?.open();
+      await client.connect().block();
+
+      expect(sockets[2]?.decodeSent(0, metadataMimeType, dataMimeType)).toBeInstanceOf(SetupFrame);
+    } finally {
+      connected.disconnect();
+    }
   });
 
   it("falls back to a fresh SETUP when RESUME_OK acknowledges an impossible client position", async () => {
@@ -2793,6 +3400,41 @@ describe("RSocket", () => {
     await client.connect().block();
   });
 
+  it("rejects malformed RESUME handshake frames before restoring a session", async () => {
+    const invalidStream = new ResumeOkFrame(0n).toUint8Array().slice();
+    invalidStream[3] = 1;
+    const invalidError = new ErrorFrame(
+      0,
+      FrameErrorCode.INVALID_SETUP,
+      WellKnownMimeType.TEXT_PLAIN.toPayload("invalid resume error")
+    ).toUint8Array();
+    const options = {
+      connectTimeoutMs: 1_000,
+      maxFrameLength: 0xffffff,
+      activityListener: undefined,
+      activityEnabled: undefined,
+      setup: { metadataMimeType, dataMimeType }
+    };
+
+    for (const bytes of [invalidStream, invalidError]) {
+      const socket = new FakeWebSocket();
+      socket.open();
+      const connection = new ReactiveWebSocketConnection(socket, undefined);
+      const response = receiveResumeOkFrame(connection, options, undefined);
+      socket.dispatchMessage(bytes);
+
+      await expect(response).rejects.toThrow("RSocket Resume responder sent");
+    }
+
+    const closedSocket = new FakeWebSocket();
+    closedSocket.open();
+    const closedConnection = new ReactiveWebSocketConnection(closedSocket, undefined);
+    closedSocket.close(1006, "lost before resume listener");
+    await expect(receiveResumeOkFrame(closedConnection, options, undefined)).rejects.toThrow(
+      "WebSocket closed during RSocket resume"
+    );
+  });
+
   it("does not open a fresh SETUP transport when disconnect aborts pending resume", async () => {
     const sockets: FakeWebSocket[] = [];
     const client = new RSocket("ws://localhost/rsocket", {
@@ -2824,6 +3466,35 @@ describe("RSocket", () => {
 
     expect(sockets).toHaveLength(2);
     expect(sockets[1]?.readyState).toBe(WS_CLOSED);
+  });
+
+  it("can connect again immediately after disconnect aborts an in-flight reconnect", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new RSocket("ws://localhost/rsocket", {
+      setup: setupOptions(20_000, 90_000, () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      }),
+      reconnect: fastReconnect()
+    });
+
+    const initialReady = client.connect().block();
+    sockets[0]?.open();
+    const connected = (await initialReady)!;
+
+    sockets[0]?.close(1006, "network lost");
+    await waitFor(() => sockets.length === 2);
+    connected.disconnect(1000, "cancel reconnect");
+
+    const nextReady = client.connect().block();
+    await waitFor(() => sockets.length === 3);
+    sockets[2]?.open();
+
+    const reconnected = await nextReady;
+    expect(reconnected).toBeDefined();
+    expect(sockets[2]?.decodeSent(0, metadataMimeType, dataMimeType)).toBeInstanceOf(SetupFrame);
+    reconnected?.disconnect();
   });
 
   it("waits for browser online before opening a reconnect transport", async () => {
@@ -3176,6 +3847,8 @@ describe("RSocket", () => {
 
     expect(sockets).toHaveLength(1);
     expect(sockets[0]?.readyState).toBe(WS_CLOSED);
+    const shutdown = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as ErrorFrame;
+    expect(shutdown.code).toBe(FrameErrorCode.CONNECTION_ERROR);
     expect(disconnects).toHaveLength(1);
   });
 
@@ -3325,9 +3998,47 @@ describe("RSocket", () => {
 
     expect(errors[0]).toBeInstanceOf(Error);
     expect((errors[0] as Error).message).toBe("iterator construction failed");
-    const frame = socket.decodeSent(1, metadataMimeType, dataMimeType) as ErrorFrame;
+    expect(socket.sent).toHaveLength(1);
+  });
+
+  it("sends channel application errors only after REQUEST_CHANNEL was established", async () => {
+    const { client, socket } = await connect();
+    const errors: unknown[] = [];
+    let subscription: Subscription | undefined;
+    let reads = 0;
+    const input: Iterable<{ data: { n: number } }> = {
+      [Symbol.iterator]() {
+        return {
+          next() {
+            reads += 1;
+            if (reads === 1) return { done: false, value: { data: { n: 1 } } };
+            throw new Error("channel source failed");
+          }
+        };
+      }
+    };
+
+    client.requestChannel(input).subscribe({
+      onSubscribe(nextSubscription) {
+        subscription = nextSubscription;
+      },
+      onNext() {},
+      onError(error) {
+        errors.push(error);
+      },
+      onComplete() {}
+    });
+    subscription?.request(1);
+    await waitFor(() => socket.sent.length === 2);
+
+    const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestChannelFrame;
+    socket.serverSend(new RequestNFrame(request.header.streamId, 1));
+    await waitFor(() => errors.length === 1 && socket.sent.length === 3);
+
+    const frame = socket.decodeSent(2, metadataMimeType, dataMimeType) as ErrorFrame;
     expect(frame).toBeInstanceOf(ErrorFrame);
     expect(frame.code).toBe(FrameErrorCode.APPLICATION_ERROR);
+    expect((errors[0] as Error).message).toBe("channel source failed");
   });
 
   it("does not return a naturally completed request-channel iterator", async () => {
@@ -3587,7 +4298,7 @@ describe("RSocket", () => {
   });
 
   it("rejects incoming WebSocket messages larger than maxFrameLength before deserializing", async () => {
-    const { client, socket } = await connect({
+    const { socket } = await connect({
       autoReconnect: false,
       maxFrameLength: 1_024
     });

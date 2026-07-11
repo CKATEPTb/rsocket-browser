@@ -15,7 +15,7 @@ import {
   RequestStreamController,
   RSocket
 } from "@";
-import type { RSocketPayloadFrame, RSocketWebSocket } from "@/types/index.js";
+import type { RSocketWebSocket } from "@/types/index.js";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 const serverProject = resolve(projectRoot, "test/spring-boot-rsocket-server/pom.xml");
@@ -242,6 +242,68 @@ describe("RSocket Spring Boot WebSocket Resume integration", () => {
       expect(after.setups).toBe(before.setups);
       expect(after.requestResponse).toBe(before.requestResponse + 2);
     } finally {
+      connected.disconnect();
+    }
+  }, 30_000);
+
+  it("keeps an active Spring request-stream across WebSocket Resume", async () => {
+    const sockets: WebSocket[] = [];
+    const events: Array<{ readonly type: string; readonly reconnect: boolean }> = [];
+    const socket = createSocket({
+      transport: (url: string | URL) => {
+        const websocket = new WebSocket(url);
+        sockets.push(websocket);
+        return websocket as unknown as RSocketWebSocket;
+      },
+      reconnect: {
+        resume: 30_000,
+        delay: 100,
+        minDelay: 100,
+        maxDelay: 100,
+        minUptime: 0
+      },
+      events: {
+        event: (event: any) => events.push({ type: event.type, reconnect: event.reconnect })
+      }
+    });
+    const connected = await connectedSocket(socket);
+    const received: Array<{ readonly n: number }> = [];
+    const failures: unknown[] = [];
+    let completed = false;
+    let subscription: Subscription | undefined;
+
+    try {
+      const before = await springStats(socket);
+      connected.process(new SpringNumbersController(), { count: 3 }).subscribe({
+        onSubscribe(next: Subscription) {
+          subscription = next;
+          next.request(1);
+        },
+        onNext(value: { readonly n: number }) {
+          received.push(value);
+        },
+        onError(error: unknown) {
+          failures.push(error);
+        },
+        onComplete() {
+          completed = true;
+        }
+      });
+
+      await waitFor(() => received.length === 1);
+      sockets[0]?.close(3001, "spring boot active stream resume");
+      subscription?.request(2);
+
+      await waitFor(() => events.some((event) => event.type === "connected" && event.reconnect), 10_000);
+      await waitFor(() => completed && received.length === 3, 10_000);
+      const after = await springStats(socket);
+
+      expect(received).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+      expect(failures).toHaveLength(0);
+      expect(after.setups).toBe(before.setups);
+      expect(after.requestStream).toBe(before.requestStream + 1);
+    } finally {
+      subscription?.cancel();
       connected.disconnect();
     }
   }, 30_000);
