@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Flux, type Subscription } from "reactor-core-ts";
 import { WellKnownMimeType } from "rsocket-frames-ts";
-import { RSocket } from "@";
+import { RequestResponseController, RSocket } from "@";
 import type { RSocketPayloadFrame, RSocketWebSocket } from "@/types/index.js";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -43,6 +43,20 @@ interface IntegrationStats {
   readonly requestChannel: number;
 }
 
+/** Timed request used to verify requester cancellation against rsocket-java. */
+class TimedJavaRequestController extends RequestResponseController<
+  { cmd: string; ms: number },
+  unknown
+> {
+  /** Metadata route ignored by the frame-level integration responder. */
+  protected readonly route = "test.delay";
+
+  /** Uses the short timeout required by the integration assertion. */
+  constructor() {
+    super({ timeout: 25 });
+  }
+}
+
 describe("RSocket official rsocket-java WebSocket integration", () => {
   beforeAll(async () => {
     buildJavaServer();
@@ -64,10 +78,10 @@ describe("RSocket official rsocket-java WebSocket integration", () => {
     try {
       const before = await stats(socket);
       const echo = await connected
-        .requestResponse({ data: { cmd: "echo", value: "hello" } })
+        .requestResponse({ cmd: "echo", value: "hello" })
         .block();
 
-      await connected.fireAndForget({ data: { event: "clicked" } }).block();
+      await connected.fireAndForget({ event: "clicked" }).block();
       await connected
         .metadataPush(WellKnownMimeType.TEXT_PLAIN.toMetadata("Bearer integration-token"))
         .block();
@@ -96,7 +110,7 @@ describe("RSocket official rsocket-java WebSocket integration", () => {
 
     try {
       const before = await stats(socket);
-      const response = await connected.requestResponse({ data: request }).block();
+      const response = await connected.requestResponse(request).block();
 
       expect(response.data).toEqual({
         kind: "size",
@@ -114,11 +128,11 @@ describe("RSocket official rsocket-java WebSocket integration", () => {
 
     try {
       const delayed = connected
-        .requestResponse({ data: { cmd: "delay", ms: 200 } }, { timeout: 25 })
+        .process(new TimedJavaRequestController(), { cmd: "delay", ms: 200 })
         .block();
 
       await expect(delayed).rejects.toThrow("timed out");
-      await expect(connected.requestResponse({ data: { cmd: "echo", value: "after-timeout" } }).block())
+      await expect(connected.requestResponse({ cmd: "echo", value: "after-timeout" }).block())
         .resolves
         .toMatchObject({
           data: {
@@ -142,7 +156,7 @@ describe("RSocket official rsocket-java WebSocket integration", () => {
     try {
       const before = await stats(socket);
 
-      connected.requestStream({ data: { count: 5 } }).subscribe({
+      connected.requestStream({ count: 5 }).subscribe({
         onSubscribe(next: Subscription) {
           subscription = next;
           next.request(2);
@@ -186,7 +200,7 @@ describe("RSocket official rsocket-java WebSocket integration", () => {
     try {
       const before = await stats(socket);
 
-      connected.requestStream({ data: { error: true } }).subscribe({
+      connected.requestStream({ error: true }).subscribe({
         onSubscribe(next: Subscription) {
           subscription = next;
           next.request(2);
@@ -328,7 +342,7 @@ describe("RSocket official rsocket-java WebSocket integration", () => {
       await waitFor(() => events.some((event) => event.type === "reconnecting"));
 
       const queued = socket
-        .requestResponse({ data: { cmd: "echo", value: "queued-during-reconnect" } })
+        .requestResponse({ cmd: "echo", value: "queued-during-reconnect" })
         .block();
 
       await waitFor(() => events.some((event) => event.type === "connected" && event.reconnect));
@@ -385,7 +399,7 @@ async function connectedSocket(socket: RSocket): Promise<any> {
  * Reads server-side interaction counters.
  */
 async function stats(socket: RSocket): Promise<IntegrationStats> {
-  const response = await socket.requestResponse({ data: { cmd: "stats" } }).block();
+  const response = await socket.requestResponse({ cmd: "stats" }).block();
   return response?.data as IntegrationStats;
 }
 

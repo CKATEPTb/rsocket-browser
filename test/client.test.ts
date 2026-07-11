@@ -38,11 +38,7 @@ import {
   RequestChannelController,
   RequestResponseController,
   RequestStreamController,
-  RSocket,
-  fireAndForgetController,
-  requestChannelController,
-  requestResponseController,
-  requestStreamController
+  RSocket
 } from "@";
 import { browserReconnectSignals } from "@/reconnect/index.js";
 import { normalizeResumeOptions } from "@/resume/index.js";
@@ -50,7 +46,6 @@ import { RSocketFlux } from "@/stream/index.js";
 import { emitOutboundFrameFragments, outboundFrameLength } from "@/fragmentation/index.js";
 import { ReactiveWebSocketConnection, WS_CLOSED, webSocketMessageBytes } from "@/transport/websocket/index.js";
 import { normalizeRequestOptions } from "@/rsocket/options.js";
-import { isControllerInput } from "@/rsocket/controllers.js";
 import { errorMessage } from "@/payload/index.js";
 import { withClientMetadata } from "@/metadata/index.js";
 import type { RSocketWebSocketFactory } from "@/types/index.js";
@@ -58,6 +53,23 @@ import { FakeWebSocket, fakeWebSocketFactory } from "./fake-websocket.js";
 
 const dataMimeType = WellKnownMimeType.APPLICATION_JSON;
 const metadataMimeType = WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA;
+
+/** Reusable typed request-response controller for facade and logging tests. */
+class UserLookupController extends RequestResponseController<{ id: number }, { name: string }> {
+  /** Route consumed by the user lookup responder. */
+  protected readonly route = "user.find";
+}
+
+/** Request-response controller with a configurable protocol timeout for tests. */
+class TimedRequestController extends RequestResponseController<Record<string, unknown>, unknown> {
+  /** Route used only to exercise controller-level request options. */
+  protected readonly route = "test.timeout";
+
+  /** Creates a timed controller instance. */
+  constructor(timeout: number) {
+    super({ timeout });
+  }
+}
 
 /**
  * Creates nested SETUP options used by public socket constructor tests.
@@ -94,10 +106,6 @@ function fastReconnect(options: Record<string, unknown> = {}): any {
 }
 
 describe("RSocket", () => {
-  it("does not classify function-valued application data as a controller class", () => {
-    expect(isControllerInput(() => "application callback")).toBe(false);
-  });
-
   it("keeps request options identity when MIME overrides are absent", () => {
     const empty = {};
     const timeoutOnly = { timeout: 25 };
@@ -299,7 +307,7 @@ describe("RSocket", () => {
   it("performs request-response with decoded JSON payloads", async () => {
     const { client, socket } = await connect();
 
-    const response = client.requestResponse({ data: { hello: "world" } }).block();
+    const response = client.requestResponse({ hello: "world" }).block();
     expect(socket.sent).toHaveLength(2);
 
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
@@ -355,7 +363,7 @@ describe("RSocket", () => {
 
   it("assumes request-response COMPLETE when the responder omits it", async () => {
     const { client, socket } = await connect();
-    const response = client.requestResponse({ data: { splitTerminal: true } }).block();
+    const response = client.requestResponse({ splitTerminal: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(
@@ -371,7 +379,7 @@ describe("RSocket", () => {
 
   it("completes request-response empty when COMPLETE has no NEXT payload", async () => {
     const { client, socket } = await connect();
-    const response = client.requestResponse({ data: { empty: true } }).block();
+    const response = client.requestResponse({ empty: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(new PayloadFrame(request.header.streamId, PayloadFlag.COMPLETE));
@@ -381,7 +389,7 @@ describe("RSocket", () => {
 
   it("ignores later payloads after an implicit request-response completion", async () => {
     const { client, socket } = await connect({ autoReconnect: false });
-    const response = client.requestResponse({ data: { duplicate: true } }).block();
+    const response = client.requestResponse({ duplicate: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(
@@ -413,7 +421,7 @@ describe("RSocket", () => {
     const payloadBytes = vi.spyOn(Payload.prototype, "toUint8Array");
 
     try {
-      const response = client.requestResponse({ data: { hello: "cache" } }).block();
+      const response = client.requestResponse({ hello: "cache" }).block();
       const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
       expect(request).toBeInstanceOf(RequestResponseFrame);
@@ -436,7 +444,7 @@ describe("RSocket", () => {
 
   it("parses each inbound frame header only once", async () => {
     const { client, socket } = await connect();
-    const response = client.requestResponse({ data: { singleHeaderParse: true } }).block();
+    const response = client.requestResponse({ singleHeaderParse: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     const header = vi.spyOn(Header, "from");
 
@@ -486,7 +494,7 @@ describe("RSocket", () => {
       await expect(payloadResponse).resolves.toMatchObject({ data: { ok: true } });
 
       const metadataResponse = client
-        .requestResponse(rawMetadata, { metadataMimeType: WellKnownMimeType.TEXT_PLAIN })
+        .requestResponse(undefined, rawMetadata, { metadata: WellKnownMimeType.TEXT_PLAIN })
         .block();
       const metadataRequest = socket.decodeSent(
         2,
@@ -514,7 +522,7 @@ describe("RSocket", () => {
   it("rejects request-response when the responder sends an ERROR frame", async () => {
     const { client, socket } = await connect();
 
-    const response = client.requestResponse({ data: { fail: true } }).block();
+    const response = client.requestResponse({ fail: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(
@@ -536,7 +544,7 @@ describe("RSocket", () => {
   it("treats a flagless request-response PAYLOAD as implicit empty completion", async () => {
     const { client, socket } = await connect({ autoReconnect: false });
 
-    const response = client.requestResponse({ data: { invalid: true } }).block();
+    const response = client.requestResponse({ invalid: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(new PayloadFrame(request.header.streamId, 0));
@@ -563,7 +571,7 @@ describe("RSocket", () => {
 
   it("ignores a server request that reuses an active client stream ID", async () => {
     const { client, socket } = await connect({ autoReconnect: false });
-    const response = client.requestResponse({ data: { active: true } }).block();
+    const response = client.requestResponse({ active: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(
@@ -593,7 +601,7 @@ describe("RSocket", () => {
   it("ignores REQUEST_N for request-response", async () => {
     const { client, socket } = await connect({ autoReconnect: false });
 
-    const response = client.requestResponse({ data: { invalid: "request-n" } }).block();
+    const response = client.requestResponse({ invalid: "request-n" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
     socket.serverSend(new RequestNFrame(request.header.streamId, 1));
@@ -613,7 +621,7 @@ describe("RSocket", () => {
 
   it("keeps JSON objects with payload-like keys as application data", async () => {
     const { client, socket } = await connect();
-    const response = client.requestResponse({ data: { model: "codec-shaped" } }).block();
+    const response = client.requestResponse({ model: "codec-shaped" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     const data = { payload: { id: 42 }, mimeType: "domain/chat" };
 
@@ -633,7 +641,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect();
 
     const response = client
-      .requestResponse({ data: { slow: true } }, { timeout: 5 })
+      .process(new TimedRequestController(5), { slow: true })
       .block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
 
@@ -664,10 +672,10 @@ describe("RSocket", () => {
       };
 
       const response = client
-        .requestResponse({ data: { immediate: true } }, { timeout: 5 })
+        .process(new TimedRequestController(5), { immediate: true })
         .block();
 
-      await expect(response).resolves.toMatchObject({ data: { ok: true } });
+      await expect(response).resolves.toMatchObject({ ok: true });
       await vi.advanceTimersByTimeAsync(5);
 
       const sentFrames = socket.sent.map((_bytes, index) => socket.decodeSent(index, metadataMimeType, dataMimeType));
@@ -680,7 +688,7 @@ describe("RSocket", () => {
   it("allocates odd client stream IDs sequentially across interaction models", async () => {
     const { client, socket } = await connect();
 
-    const response = client.requestResponse({ data: { interaction: "rr" } }).block();
+    const response = client.requestResponse({ interaction: "rr" }).block();
     const requestResponse = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     socket.serverSend(
       new PayloadFrame(
@@ -692,10 +700,10 @@ describe("RSocket", () => {
     );
     await response;
 
-    await client.fireAndForget({ data: { interaction: "fnf" } }).block();
+    await client.fireAndForget({ interaction: "fnf" }).block();
 
     let streamSubscription: Subscription | undefined;
-    client.requestStream({ data: { interaction: "stream" } }).subscribe({
+    client.requestStream({ interaction: "stream" }).subscribe({
       onSubscribe(subscription) {
         streamSubscription = subscription;
       },
@@ -731,7 +739,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect();
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "never-started" } }).subscribe({
+    client.requestStream({ route: "never-started" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -743,7 +751,7 @@ describe("RSocket", () => {
     });
     subscription?.cancel();
 
-    await client.fireAndForget({ data: { firstWireInteraction: true } }).block();
+    await client.fireAndForget({ firstWireInteraction: true }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestFireAndForgetFrame;
 
     expect(request).toBeInstanceOf(RequestFireAndForgetFrame);
@@ -756,7 +764,7 @@ describe("RSocket", () => {
       setup: setupOptions(20_000, 90_000, fakeWebSocketFactory(socket))
     });
 
-    const response = client.requestResponse({ data: { hello: "queued" } }).block();
+    const response = client.requestResponse({ hello: "queued" }).block();
     expect(socket.sent).toHaveLength(0);
 
     socket.open();
@@ -784,7 +792,7 @@ describe("RSocket", () => {
     });
     let subscription: Subscription | undefined;
 
-    client.requestResponse({ data: { cancelled: true } }).subscribe({
+    client.requestResponse({ cancelled: true }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -809,7 +817,7 @@ describe("RSocket", () => {
     const snapshot = client.metadataUpdate(authMetadata);
     expect(snapshot.get(WellKnownMimeType.TEXT_PLAIN)).toBe(authMetadata);
 
-    const response = client.requestResponse({ data: { hello: "metadata" } }).block();
+    const response = client.requestResponse({ hello: "metadata" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     const metadata = (request as any).metadata;
 
@@ -841,7 +849,7 @@ describe("RSocket", () => {
     });
     expect(authenticated.has(authenticationMimeType)).toBe(true);
 
-    await client.fireAndForget({ data: { authenticated: true } }).block();
+    await client.fireAndForget({ authenticated: true }).block();
     const authenticatedRequest = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestFireAndForgetFrame;
     const composite = (authenticatedRequest as unknown as { metadata: Metadata<Metadata<any>[]> }).metadata;
     const authentication = composite.payload.find(
@@ -855,7 +863,7 @@ describe("RSocket", () => {
     });
     expect(anonymous.has(authenticationMimeType)).toBe(false);
 
-    await client.fireAndForget({ data: { authenticated: false } }).block();
+    await client.fireAndForget({ authenticated: false }).block();
     const anonymousRequest = socket.decodeSent(2, metadataMimeType, dataMimeType) as RequestFireAndForgetFrame;
     expect((anonymousRequest as any).metadata).toBeUndefined();
   });
@@ -870,10 +878,7 @@ describe("RSocket", () => {
       metadata.set(authenticationMimeType, WellKnownAuthType.BEARER.auth(token));
     });
 
-    await client.fireAndForget({
-      data: { interaction: true },
-      metadata: routingMimeType.toMetadata(["interaction.route"])
-    }).block();
+    await client.fireAndForget({ interaction: true }, routingMimeType.toMetadata(["interaction.route"])).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestFireAndForgetFrame;
     const requestEntries = (request as unknown as { metadata: Metadata<Metadata<any>[]> }).metadata.payload;
     const requestRoutes = requestEntries.filter((entry) => entry.mimeType.mimeType === routingMimeType.mimeType);
@@ -979,12 +984,14 @@ describe("RSocket", () => {
     const payloadBytes = new Uint8Array([7, 8, 9]);
     client.metadataUpdate(WellKnownMimeType.TEXT_PLAIN.toMetadata("Bearer envelope-token"));
 
-    const response = client.requestResponse({
-      data: payloadBytes,
-      dataMimeType: WellKnownMimeType.APPLICATION_OCTET_STREAM,
-      metadata: "request-metadata",
-      metadataMimeType: WellKnownMimeType.TEXT_PLAIN
-    }).block();
+    const response = client.requestResponse(
+      payloadBytes,
+      "request-metadata",
+      {
+        data: WellKnownMimeType.APPLICATION_OCTET_STREAM,
+        metadata: WellKnownMimeType.TEXT_PLAIN
+      }
+    ).block();
     const request = socket.decodeSent(
       1,
       metadataMimeType,
@@ -1063,7 +1070,7 @@ describe("RSocket", () => {
     sockets[0]?.open();
     await ready;
 
-    const mono = client.requestResponse({ data: { after: "reconnect" } });
+    const mono = client.requestResponse({ after: "reconnect" });
     sockets[0]?.close(1006, "network lost");
     await waitFor(() => sockets.length === 2);
     sockets[1]?.open();
@@ -1101,7 +1108,7 @@ describe("RSocket", () => {
     sockets[0]?.open();
     await ready;
 
-    const stream = client.requestStream({ data: { after: "reconnect-stream" } });
+    const stream = client.requestStream({ after: "reconnect-stream" });
     sockets[0]?.close(1006, "network lost");
     await waitFor(() => sockets.length === 2);
     sockets[1]?.open();
@@ -1134,7 +1141,7 @@ describe("RSocket", () => {
     let subscription: Subscription | undefined;
 
     try {
-      client.requestStream({ data: { route: "direct-subscription" } }).subscribe({
+      client.requestStream({ route: "direct-subscription" }).subscribe({
         onSubscribe(nextSubscription) {
           subscription = nextSubscription;
         },
@@ -1160,7 +1167,7 @@ describe("RSocket", () => {
     const ready = client.connect().block();
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "queued-stream" } }).subscribe({
+    client.requestStream({ route: "queued-stream" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -1201,7 +1208,7 @@ describe("RSocket", () => {
     }));
 
     logs.length = 0;
-    const response = client.requestResponse({ data: { hello: "logged" } }).block();
+    const response = client.requestResponse({ hello: "logged" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
 
     socket.serverSend(
@@ -1251,7 +1258,7 @@ describe("RSocket", () => {
     });
 
     logs.length = 0;
-    const response = client.requestResponse({ data: { hello: "quiet-frame" } }).block();
+    const response = client.requestResponse({ hello: "quiet-frame" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
     socket.serverSend(
       new PayloadFrame(
@@ -1279,29 +1286,35 @@ describe("RSocket", () => {
     expect(logs).toHaveLength(0);
   });
 
-  it("processes declarative controllers with inferred arguments and results", async () => {
-    const { client, connected, socket } = await connect();
-    const getUser = requestResponseController(
-      "user.find",
-      (id: number) => ({ id }),
-      (payload) => payload.data as { name: string }
-    );
-    const publishEvent = fireAndForgetController("event.opened", (name: string) => ({ name }));
-    const streamNumbers = requestStreamController(
-      "numbers",
-      (limit: number) => ({ limit }),
-      (payload) => payload.data as { n: number }
-    );
-    const chat = requestChannelController(
-      "chat",
-      (room: string) => Flux.fromArray([{ data: { room, text: "hello" } }]),
-      (payload) => payload.data as { accepted: boolean }
-    );
+  it("processes declarative class controllers with inferred arguments and results", async () => {
+    /** Fire-and-forget controller used to verify process return inference. */
+    class PublishEventController extends FireAndForgetController<{ name: string }> {
+      /** Route consumed by the event responder. */
+      protected readonly route = "event.opened";
+    }
+    /** Request-stream controller used to verify process return inference. */
+    class StreamNumbersController extends RequestStreamController<{ limit: number }, { n: number }> {
+      /** Route consumed by the number responder. */
+      protected readonly route = "numbers";
+    }
+    /** Request-channel controller used to verify process return inference. */
+    class ChatController extends RequestChannelController<
+      { room: string; text: string },
+      { accepted: boolean }
+    > {
+      /** Route consumed by the chat responder. */
+      protected readonly route = "chat";
+    }
 
-    const responseMono: Mono<{ name: string }> = connected.process(getUser, 7);
-    const eventMono: Mono<void> = client.process(publishEvent, "menu");
-    const numberFlux: Flux<{ n: number }> = client.process(streamNumbers, 3);
-    const chatFlux: Flux<{ accepted: boolean }> = client.process(chat, "general");
+    const { client, connected, socket } = await connect();
+
+    const responseMono: Mono<{ name: string }> = connected.process(UserLookupController, { id: 7 });
+    const eventMono: Mono<void> = client.process(PublishEventController, { name: "menu" });
+    const numberFlux: Flux<{ n: number }> = client.process(StreamNumbersController, { limit: 3 });
+    const chatFlux: Flux<{ accepted: boolean }> = client.process(
+      ChatController,
+      Flux.fromArray([{ data: { room: "general", text: "hello" } }])
+    );
 
     expect(eventMono).toBeInstanceOf(Mono);
     expect(numberFlux).toBeInstanceOf(Flux);
@@ -1323,28 +1336,6 @@ describe("RSocket", () => {
     );
 
     await expect(response).resolves.toEqual({ name: "Ada" });
-  });
-
-  it("skips Reactor map operators for raw factory controller decoders", async () => {
-    const { client } = await connect();
-    const mapMono = vi.spyOn(Mono.prototype, "map");
-    const mapFlux = vi.spyOn(Flux.prototype, "map");
-
-    try {
-      const rawResponse = requestResponseController("raw.response", (id: number) => ({ id }));
-      const rawStream = requestStreamController("raw.stream", (limit: number) => ({ limit }));
-
-      const responseMono: Mono<unknown> = client.process(rawResponse, 7);
-      const streamFlux: Flux<unknown> = client.process(rawStream, 3);
-
-      expect(responseMono).toBeInstanceOf(Mono);
-      expect(streamFlux).toBeInstanceOf(Flux);
-      expect(mapMono).not.toHaveBeenCalled();
-      expect(mapFlux).not.toHaveBeenCalled();
-    } finally {
-      mapMono.mockRestore();
-      mapFlux.mockRestore();
-    }
   });
 
   it("processes Spring-style class controllers with typed request and response bodies", async () => {
@@ -1443,7 +1434,7 @@ describe("RSocket", () => {
       );
     })).toThrow(/MESSAGE_RSOCKET_COMPOSITE_METADATA/);
 
-    await client.fireAndForget({ data: { usesDefaultRoute: true } }).block();
+    await client.fireAndForget({ usesDefaultRoute: true }).block();
     const defaultRequest = socket.decodeSent(1, routingMimeType, dataMimeType) as RequestFireAndForgetFrame;
     const defaultMetadata = (defaultRequest as unknown as { metadata: Metadata<string[]> }).metadata;
     expect(defaultMetadata.payload).toEqual(["account.default"]);
@@ -1486,7 +1477,7 @@ describe("RSocket", () => {
       metadata.set(WellKnownMimeType.MESSAGE_RSOCKET_ROUTING, ["unsupported.route"]);
     })).toThrow(/MESSAGE_RSOCKET_COMPOSITE_METADATA/);
 
-    await client.fireAndForget({ data: { authenticated: true } }).block();
+    await client.fireAndForget({ authenticated: true }).block();
     const request = socket.decodeSent(1, authenticationMimeType, dataMimeType) as RequestFireAndForgetFrame;
     const requestMetadata = (request as unknown as { metadata: Metadata<{ data: string }> }).metadata;
 
@@ -1698,17 +1689,12 @@ describe("RSocket", () => {
   it("logs only a declarative controller interaction when controller.log is used", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { client, socket } = await connect();
-    const getUser = requestResponseController(
-      "user.find",
-      (id: number) => ({ id }),
-      (payload) => payload.data as { name: string }
-    )
-      .log({
-        payload: true,
-        logger: (event: any) => logs.push(event)
-      });
+    const getUser = new UserLookupController().log({
+      payload: true,
+      logger: (event: any) => logs.push(event)
+    });
 
-    const response = client.requestResponse(getUser, 7).block();
+    const response = client.process(getUser, { id: 7 }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
     socket.serverSend(
       new PayloadFrame(
@@ -1735,14 +1721,10 @@ describe("RSocket", () => {
   it("preserves request cancellation through controller interaction logging", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { client, connected, socket } = await connect();
-    const getUser = requestResponseController(
-      "user.find",
-      (id: number) => ({ id }),
-      (payload) => payload.data as { name: string }
-    ).log({ logger: (event: any) => logs.push(event) });
+    const getUser = new UserLookupController().log({ logger: (event: any) => logs.push(event) });
     let subscription: Subscription | undefined;
 
-    client.requestResponse(getUser, 7).subscribe({
+    client.process(getUser, { id: 7 }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -1764,18 +1746,14 @@ describe("RSocket", () => {
     connected.disconnect();
   });
 
-  it("disables declarative factory controller logs after they were enabled", async () => {
+  it("disables declarative class controller logs after they were enabled", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { client, socket } = await connect();
-    const getUser = requestResponseController(
-      "user.find",
-      (id: number) => ({ id }),
-      (payload) => payload.data as { name: string }
-    )
+    const getUser = new UserLookupController()
       .log({ logger: (event: any) => logs.push(event) })
       .log(false);
 
-    const response = client.requestResponse(getUser, 7).block();
+    const response = client.process(getUser, { id: 7 }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
     socket.serverSend(
       new PayloadFrame(
@@ -1792,7 +1770,7 @@ describe("RSocket", () => {
 
   it("reassembles fragmented PAYLOAD frames before decoding", async () => {
     const { client, socket } = await connect();
-    const response = client.requestResponse({ data: { hello: "fragmented" } }).block();
+    const response = client.requestResponse({ hello: "fragmented" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
     const encoder = new TextEncoder();
 
@@ -1818,7 +1796,7 @@ describe("RSocket", () => {
 
   it("lets COMPLETE terminate a PAYLOAD even when FOLLOWS is also set", async () => {
     const { client, socket } = await connect();
-    const response = client.requestResponse({ data: { hello: "contradictory-flags" } }).block();
+    const response = client.requestResponse({ hello: "contradictory-flags" }).block();
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType);
 
     socket.serverSend(
@@ -1849,7 +1827,7 @@ describe("RSocket", () => {
     const ready = client.connect().block();
     socket.open();
     await ready;
-    const response = client.requestResponse({ data: { hello: "fragmented-metadata" } }).block();
+    const response = client.requestResponse({ hello: "fragmented-metadata" }).block();
     const request = socket.decodeSent(1, WellKnownMimeType.APPLICATION_OCTET_STREAM, dataMimeType);
     const encoder = new TextEncoder();
 
@@ -1891,13 +1869,14 @@ describe("RSocket", () => {
 
     try {
       const response = client
-        .requestResponse({
-          data: WellKnownMimeType.APPLICATION_OCTET_STREAM.toPayload(payloadBytes),
-          metadata: new Metadata(WellKnownMimeType.APPLICATION_OCTET_STREAM, metadataBytes)
-        }, {
-          dataMimeType: WellKnownMimeType.APPLICATION_OCTET_STREAM,
-          metadataMimeType: WellKnownMimeType.APPLICATION_OCTET_STREAM
-        })
+        .requestResponse(
+          WellKnownMimeType.APPLICATION_OCTET_STREAM.toPayload(payloadBytes),
+          new Metadata(WellKnownMimeType.APPLICATION_OCTET_STREAM, metadataBytes),
+          {
+            data: WellKnownMimeType.APPLICATION_OCTET_STREAM,
+            metadata: WellKnownMimeType.APPLICATION_OCTET_STREAM
+          }
+        )
         .block();
 
       await waitFor(() => socket.sent.length > 3);
@@ -1983,13 +1962,14 @@ describe("RSocket", () => {
       maxFrameLength: 96
     });
     const response = client
-      .requestResponse({
-        data: WellKnownMimeType.APPLICATION_OCTET_STREAM.toPayload(payloadBytes),
-        metadata: new Metadata(WellKnownMimeType.APPLICATION_OCTET_STREAM, new Uint8Array())
-      }, {
-        dataMimeType: WellKnownMimeType.APPLICATION_OCTET_STREAM,
-        metadataMimeType: WellKnownMimeType.APPLICATION_OCTET_STREAM
-      })
+      .requestResponse(
+        WellKnownMimeType.APPLICATION_OCTET_STREAM.toPayload(payloadBytes),
+        new Metadata(WellKnownMimeType.APPLICATION_OCTET_STREAM, new Uint8Array()),
+        {
+          data: WellKnownMimeType.APPLICATION_OCTET_STREAM,
+          metadata: WellKnownMimeType.APPLICATION_OCTET_STREAM
+        }
+      )
       .block();
 
     await waitFor(() => socket.sent.length >= 3);
@@ -2030,7 +2010,7 @@ describe("RSocket", () => {
     const values: unknown[] = [];
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "numbers" } }).subscribe({
+    client.requestStream({ route: "numbers" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2078,7 +2058,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect();
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "big" } }).subscribe({
+    client.requestStream({ route: "big" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2103,7 +2083,7 @@ describe("RSocket", () => {
     const errors: unknown[] = [];
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "errors" } }).subscribe({
+    client.requestStream({ route: "errors" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2139,7 +2119,7 @@ describe("RSocket", () => {
     let completed = false;
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "cancelled" } }).subscribe({
+    client.requestStream({ route: "cancelled" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2178,7 +2158,7 @@ describe("RSocket", () => {
     let subscription: Subscription | undefined;
     let completed = false;
 
-    client.requestStream({ data: { route: "cancel-on-next" } }).subscribe({
+    client.requestStream({ route: "cancel-on-next" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2213,7 +2193,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect();
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "errors" } }).subscribe({
+    client.requestStream({ route: "errors" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2244,7 +2224,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect();
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "complete" } }).subscribe({
+    client.requestStream({ route: "complete" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2271,7 +2251,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect();
 
     expect(() => {
-      client.requestStream({ data: { route: "subscribe-throws" } }).subscribe({
+      client.requestStream({ route: "subscribe-throws" }).subscribe({
         onSubscribe() {
           throw new Error("consumer subscribe failed");
         },
@@ -2310,7 +2290,7 @@ describe("RSocket", () => {
     const errors: unknown[] = [];
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "numbers" } }).subscribe({
+    client.requestStream({ route: "numbers" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2361,7 +2341,7 @@ describe("RSocket", () => {
     let completed = false;
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "invalid-payload" } }).subscribe({
+    client.requestStream({ route: "invalid-payload" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2391,7 +2371,7 @@ describe("RSocket", () => {
     let completed = false;
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "invalid-request-n" } }).subscribe({
+    client.requestStream({ route: "invalid-request-n" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -2438,7 +2418,7 @@ describe("RSocket", () => {
       FrameErrorCode.REJECTED_RESUME
     ]) {
       const { client, socket } = await connect({ autoReconnect: false });
-      const response = client.requestResponse({ data: { establish: true } }).block();
+      const response = client.requestResponse({ establish: true }).block();
       const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
       socket.serverSend(
         new PayloadFrame(
@@ -2654,7 +2634,7 @@ describe("RSocket", () => {
     sockets[0]?.open();
     await ready;
 
-    const response = client.requestResponse({ data: { hello: "resume-position" } }).block();
+    const response = client.requestResponse({ hello: "resume-position" }).block();
     const requestBytes = BigInt(sockets[0]?.sent[1]?.byteLength ?? 0);
     const request = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     const responseFrame = new PayloadFrame(
@@ -2688,7 +2668,7 @@ describe("RSocket", () => {
     sockets[1]?.serverSend(new ResumeOkFrame(resume.firstAvailableClientPosition));
     await client.connect().block();
 
-    const resumedResponse = client.requestResponse({ data: { hello: "after-resume" } }).block();
+    const resumedResponse = client.requestResponse({ hello: "after-resume" }).block();
     const resumedRequest = sockets[1]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     expect(resumedRequest.header.streamId).toBe(3);
     sockets[1]?.serverSend(
@@ -2783,7 +2763,7 @@ describe("RSocket", () => {
     sockets[0]?.open();
     await ready;
 
-    const response = client.requestResponse({ data: { hello: "resume-position" } }).block();
+    const response = client.requestResponse({ hello: "resume-position" }).block();
     const request = sockets[0]?.decodeSent(1, metadataMimeType, dataMimeType) as RequestResponseFrame;
     sockets[0]?.serverSend(
       new PayloadFrame(
@@ -3042,7 +3022,7 @@ describe("RSocket", () => {
 
   it("fails in-flight requests on disconnect instead of pretending to resume them", async () => {
     const { client, socket } = await connect({ autoReconnect: false });
-    const response = client.requestResponse({ data: { slow: true } }).block();
+    const response = client.requestResponse({ slow: true }).block();
 
     expect(socket.decodeSent(1, metadataMimeType, dataMimeType)).toBeInstanceOf(RequestResponseFrame);
     socket.close(1006, "network lost");
@@ -3055,7 +3035,7 @@ describe("RSocket", () => {
     const { client, socket } = await connect({ autoReconnect: false });
     let subscription: Subscription | undefined;
 
-    client.requestStream({ data: { route: "numbers" } }).subscribe({
+    client.requestStream({ route: "numbers" }).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -3088,7 +3068,7 @@ describe("RSocket", () => {
     sockets[0]?.open();
     await ready;
 
-    client.requestStream({ data: { route: "numbers" } }).subscribe({
+    client.requestStream({ route: "numbers" }).subscribe({
       /** Captures subscription so the stream can start. */
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
@@ -3620,16 +3600,54 @@ describe("RSocket", () => {
     expect(error.header.streamId).toBe(0);
   });
 
-  it("processes declarative request-channel controllers with a route initial frame", async () => {
+  it("uses positional request-channel metadata in the initial frame", async () => {
     const { client, socket } = await connect();
-    const chat = requestChannelController(
-      "chat.messages",
-      (room: string) => [{ data: { room, text: "hello" } }],
-      (payload) => payload.data as { delivered: boolean }
-    );
+    const route = WellKnownMimeType.MESSAGE_RSOCKET_ROUTING.toMetadata(["chat.direct"]);
     let subscription: Subscription | undefined;
 
-    client.requestChannel(chat, "general").subscribe({
+    client.requestChannel([{ n: 1 }], route).subscribe({
+      onSubscribe(nextSubscription) {
+        subscription = nextSubscription;
+      },
+      onNext() {},
+      onError(error) {
+        throw error;
+      },
+      onComplete() {}
+    });
+    subscription?.request(1);
+    await flush();
+
+    const initial = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestChannelFrame;
+    const initialMetadata = (initial as unknown as { metadata: Metadata<Metadata<any>[]> }).metadata;
+    expect((initial as any).payload).toBeUndefined();
+    expect(initialMetadata.payload).toEqual([route]);
+
+    socket.serverSend(new RequestNFrame(initial.header.streamId, 1));
+    await flush();
+    await flush();
+
+    const next = socket.decodeSent(2, metadataMimeType, dataMimeType) as PayloadFrame;
+    expect((next as any).payload).toEqual({ n: 1 });
+  });
+
+  it("processes declarative request-channel controllers with a route initial frame", async () => {
+    /** Routed chat channel used to verify its initial request frame. */
+    class ChatMessagesController extends RequestChannelController<
+      { room: string; text: string },
+      { delivered: boolean }
+    > {
+      /** Route consumed by the chat responder. */
+      protected readonly route = "chat.messages";
+    }
+
+    const { client, socket } = await connect();
+    let subscription: Subscription | undefined;
+
+    client.process(
+      ChatMessagesController,
+      [{ data: { room: "general", text: "hello" } }]
+    ).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -3657,6 +3675,15 @@ describe("RSocket", () => {
   });
 
   it("keeps routed request-channel iterable input lazy until responder demand", async () => {
+    /** Routed chat channel used to verify lazy iterable consumption. */
+    class LazyChatController extends RequestChannelController<
+      { room: string; text: string },
+      { delivered: boolean }
+    > {
+      /** Route consumed by the lazy chat responder. */
+      protected readonly route = "chat.lazy";
+    }
+
     const { client, socket } = await connect();
     const values = [{ data: { room: "general", text: "hello" } }];
     let nextCalls = 0;
@@ -3673,14 +3700,9 @@ describe("RSocket", () => {
         };
       }
     };
-    const chat = requestChannelController(
-      "chat.lazy",
-      () => input,
-      (payload) => payload.data as { delivered: boolean }
-    );
     let subscription: Subscription | undefined;
 
-    client.requestChannel(chat).subscribe({
+    client.process(LazyChatController, input).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -3710,15 +3732,22 @@ describe("RSocket", () => {
   });
 
   it("preserves channel completion prefetch through routed Flux input", async () => {
+    /** Routed chat channel used to verify Flux completion prefetch. */
+    class PrefetchChatController extends RequestChannelController<
+      { room: string; text: string },
+      { delivered: boolean }
+    > {
+      /** Route consumed by the prefetch chat responder. */
+      protected readonly route = "chat.prefetch";
+    }
+
     const { client, socket } = await connect();
-    const chat = requestChannelController(
-      "chat.prefetch",
-      () => Flux.fromArray([{ data: { room: "general", text: "hello" } }]),
-      (payload) => payload.data as { delivered: boolean }
-    );
     let subscription: Subscription | undefined;
 
-    client.requestChannel(chat).subscribe({
+    client.process(
+      PrefetchChatController,
+      Flux.fromArray([{ data: { room: "general", text: "hello" } }])
+    ).subscribe({
       onSubscribe(nextSubscription) {
         subscription = nextSubscription;
       },
@@ -3780,9 +3809,9 @@ describe("RSocket", () => {
     expect((socket.decodeSent(3, metadataMimeType, dataMimeType) as PayloadFrame).isComplete()).toBe(true);
   });
 
-  it("creates a sink-style request channel when empty options are passed", async () => {
+  it("creates a sink-style request channel when no source is passed", async () => {
     const { client, socket } = await connect();
-    const channel = client.requestChannel({});
+    const channel = client.requestChannel();
     let subscription: Subscription | undefined;
 
     channel.subscribe({
