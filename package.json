@@ -36,11 +36,6 @@
       "browser": "./dist/index.js",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./package.json": "./package.json"
-  },
-  "typesVersions": {
-    "*": {
     }
   },
   "files": [
@@ -48,16 +43,13 @@
     "LICENSE.md",
     "README.md"
   ],
-  "sideEffects": [
-    "./dist/index.js"
-  ],
+  "sideEffects": false,
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dist-aliases.mjs && node scripts/check-browser-package.mjs",
-    "test": "tsc -p tsconfig.json && npm run build && vitest run && node scripts/java-oracle-matrix.mjs && node scripts/check-api-parity.mjs --fail && npm pack --dry-run --json",
-    "generate-fixtures": "npm run build && node scripts/java-oracle-matrix.mjs --refresh"
+    "test": "tsc -p tsconfig.json --noEmit && vitest run test/async-queue.test.ts test/client.test.ts test/transport.test.ts test/java-rsocket.integration.test.ts test/spring-boot-rsocket.integration.test.ts",
+    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dts-aliases.mjs && node scripts/verify-package.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

@@ -3,6 +3,7 @@ import { defineConfig } from "vite";
 
 const sourceRoot = fileURLToPath(new URL("./src", import.meta.url));
 const sourceEntry = (path: string) => fileURLToPath(new URL(`./src/${path}`, import.meta.url));
+const external = ["bebyte", "reactor-core-ts", "rsocket-frames-ts"];
 
 export default defineConfig({
   resolve: {
@@ -11,7 +12,7 @@ export default defineConfig({
     }
   },
   build: {
-    target: "es2020",
+    target: "es2022",
     outDir: "dist",
     emptyOutDir: true,
     minify: false,
@@ -23,7 +24,8 @@ export default defineConfig({
       formats: ["es"]
     },
     rolldownOptions: {
-      treeshake: false,
+      external,
+      treeshake: true,
       output: {
         preserveModules: true,
         preserveModulesRoot: "src",
