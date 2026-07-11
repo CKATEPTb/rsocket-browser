@@ -34,6 +34,11 @@ import type {
   RSocketStreamRequestOptions
 } from "@/types/index.js";
 
+/** UTF-8 encoder used once per cached controller route validation. */
+const ROUTE_ENCODER = new TextEncoder();
+/** Largest routing tag representable by its unsigned 8-bit length field. */
+const MAX_ROUTE_BYTES = 0xff;
+
 /**
  * Positional arguments expected by single-payload class controllers.
  */
@@ -127,10 +132,22 @@ abstract class RSocketRouteController<Request, Options extends RSocketRequestOpt
      */
     protected resolveRoute(): RSocketControllerRoute {
         const route = this.route;
-        if (route === undefined || route === "" || (Array.isArray(route) && route.length === 0)) {
+        if (route === undefined || (Array.isArray(route) && route.length === 0)) {
             throw new Error(`${this.constructor.name} must define a non-empty protected route field`);
         }
+        if (typeof route === "string") this.assertRouteSegment(route);
+        else for (const segment of route) this.assertRouteSegment(segment);
         return route;
+    }
+
+    /** Validates one tag against the RSocket routing metadata wire field. */
+    private assertRouteSegment(segment: string): void {
+        if (typeof segment !== "string" || segment.length === 0) {
+            throw new Error(`${this.constructor.name} must define non-empty route segments`);
+        }
+        if (ROUTE_ENCODER.encode(segment).byteLength > MAX_ROUTE_BYTES) {
+            throw new Error(`${this.constructor.name} route segments must be at most ${MAX_ROUTE_BYTES} UTF-8 bytes`);
+        }
     }
 
     /**

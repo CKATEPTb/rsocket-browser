@@ -97,8 +97,9 @@ function logMono<T>(
     payload: unknown
 ): Mono<T> {
     if (logging === undefined || !logging.enabled || !logging.interactions) return source;
+    const loggedPayload = logging.payload ? payload : undefined;
     return source
-        .doOnSubscribe(() => logInteraction(logging, interaction, "send", payload))
+        .doOnSubscribe(() => logInteraction(logging, interaction, "send", loggedPayload))
         .doOnNext((value) => logInteraction(logging, interaction, "receive", undefined, value))
         .doOnError((error) => logInteraction(logging, interaction, "error", undefined, undefined, error))
         .doFinally((signal) => {
@@ -117,8 +118,9 @@ function logFlux<T>(
     payload: unknown
 ): Flux<T> {
     if (logging === undefined || !logging.enabled || !logging.interactions) return source;
+    const loggedPayload = logging.payload ? payload : undefined;
     return source
-        .doOnSubscribe(() => logInteraction(logging, interaction, "send", payload))
+        .doOnSubscribe(() => logInteraction(logging, interaction, "send", loggedPayload))
         .doOnNext((value) => logInteraction(logging, interaction, "receive", undefined, value))
         .doOnComplete(() => logInteraction(logging, interaction, "complete"))
         .doOnError((error) => logInteraction(logging, interaction, "error", undefined, undefined, error));
