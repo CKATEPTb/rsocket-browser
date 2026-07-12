@@ -14,6 +14,7 @@ import type {
     RSocketPayloadDecoder
 } from "@/controllers/types.js";
 import type {RSocketChannelInput, RSocketPayloadFrame} from "@/types/index.js";
+import {transformFluxPreservingDemand} from "@/controllers/flux.js";
 
 /**
  * Executes a declarative controller against an RSocket connection.
@@ -84,7 +85,7 @@ function decodeFlux<Result>(
     source: Flux<RSocketPayloadFrame>,
     decode: RSocketPayloadDecoder<Result>
 ): Flux<Result> {
-    return source.map(decode);
+    return transformFluxPreservingDemand(source, decode);
 }
 
 /**
@@ -119,11 +120,12 @@ function logFlux<T>(
 ): Flux<T> {
     if (logging === undefined || !logging.enabled || !logging.interactions) return source;
     const loggedPayload = logging.payload ? payload : undefined;
-    return source
-        .doOnSubscribe(() => logInteraction(logging, interaction, "send", loggedPayload))
-        .doOnNext((value) => logInteraction(logging, interaction, "receive", undefined, value))
-        .doOnComplete(() => logInteraction(logging, interaction, "complete"))
-        .doOnError((error) => logInteraction(logging, interaction, "error", undefined, undefined, error));
+    return transformFluxPreservingDemand(source, (value) => value, {
+        onSubscribe: () => logInteraction(logging, interaction, "send", loggedPayload),
+        onNext: (value) => logInteraction(logging, interaction, "receive", undefined, value),
+        onComplete: () => logInteraction(logging, interaction, "complete"),
+        onError: (error) => logInteraction(logging, interaction, "error", undefined, undefined, error)
+    });
 }
 
 /**
