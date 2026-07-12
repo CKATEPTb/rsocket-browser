@@ -1,6 +1,6 @@
 {
   "name": "rsocket-browser",
-  "version": "3.3.8",
+  "version": "3.3.9",
   "description": "The RSocket client implementation over websocket with browser compatibility based on Uint8Array",
   "license": "LGPL-3.0-only",
   "author": "CKATEPTb",
@@ -48,7 +48,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "tsc -p tsconfig.json --noEmit && vitest run test/async-queue.test.ts test/client.test.ts test/transport.test.ts test/java-rsocket.integration.test.ts test/spring-boot-rsocket.integration.test.ts",
+    "test": "tsc -p tsconfig.json --noEmit && vitest run test/async-queue.test.ts test/controllers.test.ts test/client.test.ts test/transport.test.ts test/java-rsocket.integration.test.ts test/spring-boot-rsocket.integration.test.ts",
     "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dts-aliases.mjs && node scripts/verify-package.mjs"
   },
   "devDependencies": {
@@ -59,7 +59,7 @@
   },
   "dependencies": {
     "bebyte": "^1.0.2",
-    "reactor-core-ts": "^3.2.1",
+    "reactor-core-ts": "^3.2.2",
     "rsocket-frames-ts": "^1.0.9"
   }
 }
