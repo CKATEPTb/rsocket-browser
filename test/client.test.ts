@@ -1387,6 +1387,94 @@ describe("RSocket", () => {
     await expect(response).resolves.toEqual({ name: "Ada" });
   });
 
+  it("keeps controller request-stream initial demand batched with logging enabled", async () => {
+    /** Controller whose decoded Flux must preserve the first request amount. */
+    class BatchedStreamController extends RequestStreamController<void, number> {
+      /** Route consumed by the fake responder. */
+      protected readonly route = "numbers.batched";
+    }
+
+    const events: Array<Record<string, unknown>> = [];
+    const controller = new BatchedStreamController().log({
+      interactions: true,
+      logger: (event) => events.push(event as unknown as Record<string, unknown>)
+    });
+    const { client, socket } = await connect();
+    const values: number[] = [];
+    let subscription: Subscription | undefined;
+
+    client.process(controller).subscribe({
+      onSubscribe(nextSubscription) {
+        subscription = nextSubscription;
+      },
+      onNext(value) {
+        values.push(value);
+      },
+      onError(error) {
+        throw error;
+      },
+      onComplete() {}
+    });
+    subscription?.request(30);
+
+    const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestStreamFrame;
+    expect(request).toBeInstanceOf(RequestStreamFrame);
+    expect(request.request).toBe(30);
+    expect(events).toEqual([
+      expect.objectContaining({interaction: "requestStream", stage: "send"})
+    ]);
+
+    socket.serverSend(
+      new PayloadFrame(
+        request.header.streamId,
+        PayloadFlag.NEXT,
+        undefined,
+        dataMimeType.toPayload(1)
+      )
+    );
+    await flush();
+
+    expect(values).toEqual([1]);
+    expect(socket.sent).toHaveLength(2);
+
+    subscription?.request(7);
+    const requestN = socket.decodeSent(2, metadataMimeType, dataMimeType) as RequestNFrame;
+    expect(requestN).toBeInstanceOf(RequestNFrame);
+    expect(requestN.request).toBe(7);
+
+    subscription?.cancel();
+  });
+
+  it("keeps controller request-channel response demand batched", async () => {
+    /** Controller whose decoded response Flux must preserve request batching. */
+    class BatchedChannelController extends RequestChannelController<number, number> {
+      /** Route consumed by the fake responder. */
+      protected readonly route = "numbers.channel.batched";
+    }
+
+    const { client, socket } = await connect();
+    let subscription: Subscription | undefined;
+
+    client.process(BatchedChannelController, Flux.just({data: 1})).subscribe({
+      onSubscribe(nextSubscription) {
+        subscription = nextSubscription;
+      },
+      onNext() {},
+      onError(error) {
+        throw error;
+      },
+      onComplete() {}
+    });
+    subscription?.request(30);
+    await waitFor(() => socket.sent.length >= 2);
+
+    const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestChannelFrame;
+    expect(request).toBeInstanceOf(RequestChannelFrame);
+    expect(request.request).toBe(30);
+
+    subscription?.cancel();
+  });
+
   it("rejects empty or oversized controller routing tags before sending a request", async () => {
     class EmptyRouteController extends FireAndForgetController<void> {
       /** Invalid empty routing tag used by this regression test. */
