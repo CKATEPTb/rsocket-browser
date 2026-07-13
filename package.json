@@ -59,7 +59,7 @@
   },
   "dependencies": {
     "bebyte": "^1.0.2",
-    "reactor-core-ts": "^3.2.3",
+    "reactor-core-ts": "^3.2.4",
     "rsocket-frames-ts": "^1.0.9"
   }
 }
