@@ -2716,13 +2716,19 @@ describe("RSocket", () => {
   });
 
   it("closes on ERROR codes carried by an invalid stream ID", async () => {
-    for (const frame of [
-      new ErrorFrame(0, FrameErrorCode.APPLICATION_ERROR, WellKnownMimeType.TEXT_PLAIN.toPayload("bad stream")),
-      new ErrorFrame(1, FrameErrorCode.CONNECTION_ERROR, WellKnownMimeType.TEXT_PLAIN.toPayload("bad stream"))
+    for (const bytes of [
+      frameWithStreamId(
+        new ErrorFrame(1, FrameErrorCode.APPLICATION_ERROR, WellKnownMimeType.TEXT_PLAIN.toPayload("bad stream")),
+        0
+      ),
+      frameWithStreamId(
+        new ErrorFrame(0, FrameErrorCode.CONNECTION_ERROR, WellKnownMimeType.TEXT_PLAIN.toPayload("bad stream")),
+        1
+      )
     ]) {
       const { socket } = await connect({ autoReconnect: false });
 
-      socket.serverSend(frame);
+      socket.dispatchMessage(bytes);
       await waitFor(() => socket.readyState === WS_CLOSED);
 
       const error = socket.decodeSent(1, metadataMimeType, dataMimeType) as ErrorFrame;
@@ -4376,7 +4382,9 @@ describe("RSocket", () => {
     await flush();
 
     const request = socket.decodeSent(1, metadataMimeType, dataMimeType) as RequestChannelFrame;
-    socket.serverSend(new RequestNFrame(request.header.streamId, 0));
+    const invalidRequestN = new RequestNFrame(request.header.streamId, 1).toUint8Array().slice();
+    invalidRequestN.fill(0, 6);
+    socket.dispatchMessage(invalidRequestN);
     await waitFor(() => socket.readyState === WS_CLOSED);
 
     const error = socket.decodeSent(2, metadataMimeType, dataMimeType) as ErrorFrame;
@@ -4770,6 +4778,13 @@ async function connect(options: Record<string, unknown> = {}) {
   socket.open();
   const connected = (await ready)!;
   return { client, connected, socket };
+}
+
+/** Rewrites the wire stream ID so invalid peer frames bypass strict constructors. */
+function frameWithStreamId(frame: Frame, streamId: number): Uint8Array {
+  const bytes = frame.toUint8Array().slice();
+  new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(0, streamId, false);
+  return bytes;
 }
 
 /**

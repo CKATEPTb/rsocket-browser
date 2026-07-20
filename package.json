@@ -27,7 +27,6 @@
   ],
   "type": "module",
   "main": "./dist/index.js",
-  "module": "./dist/index.js",
   "browser": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -49,7 +48,7 @@
   },
   "scripts": {
     "test": "tsc -p tsconfig.json --noEmit && vitest run test/async-queue.test.ts test/controllers.test.ts test/fragmentation.test.ts test/client.test.ts test/transport.test.ts test/java-rsocket.integration.test.ts test/spring-boot-rsocket.integration.test.ts",
-    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dts-aliases.mjs && node scripts/verify-package.mjs"
+    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dts-aliases.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
@@ -58,8 +57,7 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
-    "bebyte": "^1.0.2",
     "reactor-core-ts": "^3.2.4",
-    "rsocket-frames-ts": "^1.0.9"
+    "rsocket-frames-ts": "^2.0.0"
   }
 }

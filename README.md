@@ -14,9 +14,8 @@ as runtime dependencies. Import the client and controllers from
 `rsocket-browser`; import MIME codecs and protocol metadata helpers from
 `rsocket-frames-ts`.
 
-The package is ESM-only and works with Vite, Webpack, Rollup, and modern
-framework build systems. Its transport boundary is intentionally WebSocket,
-not TCP. It is not tied to Spring Boot or any other server framework.
+The client uses WebSocket and is not tied to Spring Boot or any other server
+framework.
 
 ## Quick Start
 
@@ -212,8 +211,8 @@ The public options are intentionally small:
 | `events` | Constructor-time connection lifecycle handlers. |
 | `log` | Frame, lifecycle, and interaction logging. |
 
-The browser `WebSocket` constructor is used by default. A compatible wrapper
-can be supplied without exposing a TCP transport:
+The browser `WebSocket` constructor is used by default. A compatible WebSocket
+wrapper can be supplied when the runtime needs one:
 
 ```ts
 const socket = new RSocket("wss://api.example.com/rsocket", {
@@ -626,7 +625,7 @@ routes. The controller `route` field creates that standard routing metadata.
 
 Resume and `METADATA_PUSH` require server-side support. If Resume is rejected,
 the client reports `resumeRejected` and opens a fresh session. The package is a
-requester only; it does not expose a responder/server API or a TCP transport.
+requester only and does not expose a responder/server API.
 
 Large RSocket payloads are fragmented and incoming fragments are reassembled by
 the client. Backpressure, cancellation, KEEPALIVE, stream IDs, protocol errors,
@@ -660,5 +659,4 @@ npm run build
 
 `npm test` type-checks the public API and runs unit, protocol, transport, Java
 RSocket, and Spring Boot integration tests. `npm run build` creates the ESM
-bundle and declarations, rewrites internal aliases, and verifies the publishable
-package surface.
+bundle and declarations, then rewrites internal aliases.

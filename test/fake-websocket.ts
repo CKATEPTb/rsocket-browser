@@ -2,8 +2,7 @@
  * In-memory WebSocket implementation used by protocol and reconnect tests.
  */
 import type { Frame, MimeType } from "rsocket-frames-ts";
-import { FrameDeserializer, FrameType, Header, WellKnownMimeType } from "rsocket-frames-ts";
-import bebyte from "bebyte";
+import { FrameDeserializer, FrameType, WellKnownMimeType } from "rsocket-frames-ts";
 import type { RSocketWebSocket, RSocketWebSocketData } from "@/types/index.js";
 import { WS_CLOSED, WS_CONNECTING, WS_OPEN } from "@/transport/websocket/index.js";
 
@@ -118,11 +117,12 @@ export class FakeWebSocket implements RSocketWebSocket {
   decodeSent(index: number, metadataMimeType: MimeType<any>, dataMimeType: MimeType<any>): Frame {
     const bytes = this.sent[index];
     if (!bytes) throw new Error(`No sent frame at index ${index}`);
-    const header = Header.from(bebyte.reader(bytes));
+    if (bytes.byteLength < 6) throw new RangeError("An RSocket frame header requires six bytes");
+    const frameType = FrameType.fromByte((bytes[4]! << 8 | bytes[5]!) >>> 10);
     const payloadMimeType =
-      header.frameType === FrameType.KEEPALIVE
+      frameType === FrameType.KEEPALIVE
         ? WellKnownMimeType.APPLICATION_OCTET_STREAM
-        : header.frameType === FrameType.ERROR
+        : frameType === FrameType.ERROR
           ? WellKnownMimeType.TEXT_PLAIN
           : dataMimeType;
     return FrameDeserializer.deserialize(bytes, metadataMimeType, payloadMimeType);
