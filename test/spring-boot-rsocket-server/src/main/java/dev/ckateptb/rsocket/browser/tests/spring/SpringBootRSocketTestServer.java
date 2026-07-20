@@ -45,10 +45,12 @@ public class SpringBootRSocketTestServer {
    */
   @Bean
   RSocketServerCustomizer springBootRSocketResume(
-      @Value("${test.rsocket.resume-ttl-ms:30000}") long resumeTtlMs) {
+      @Value("${test.rsocket.resume-ttl-ms:30000}") long resumeTtlMs,
+      @Value("${test.rsocket.fragment-mtu:1024}") int fragmentMtu) {
     return server ->
         server
             .payloadDecoder(PayloadDecoder.ZERO_COPY)
+            .fragment(fragmentMtu)
             .resume(new Resume().sessionDuration(Duration.ofMillis(resumeTtlMs)));
   }
 
@@ -143,6 +145,18 @@ final class SpringBootRSocketController {
     stats.requestStream.incrementAndGet();
     int count = request.getOrDefault("count", 3);
     return Flux.range(1, count).map(value -> Map.of("n", value));
+  }
+
+  /**
+   * Echoes large values as a demand-controlled stream so both the initial
+   * request and every response item require protocol fragmentation.
+   */
+  @MessageMapping("fragmented-numbers")
+  Flux<Map<String, Object>> fragmentedNumbers(Map<String, Object> request) {
+    stats.requestStream.incrementAndGet();
+    int count = (Integer) request.getOrDefault("count", 2);
+    Object value = request.get("value");
+    return Flux.range(1, count).map(index -> Map.of("n", index, "value", value));
   }
 
   /**

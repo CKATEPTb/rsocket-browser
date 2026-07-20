@@ -48,7 +48,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "tsc -p tsconfig.json --noEmit && vitest run test/async-queue.test.ts test/controllers.test.ts test/client.test.ts test/transport.test.ts test/java-rsocket.integration.test.ts test/spring-boot-rsocket.integration.test.ts",
+    "test": "tsc -p tsconfig.json --noEmit && vitest run test/async-queue.test.ts test/controllers.test.ts test/fragmentation.test.ts test/client.test.ts test/transport.test.ts test/java-rsocket.integration.test.ts test/spring-boot-rsocket.integration.test.ts",
     "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/rewrite-dts-aliases.mjs && node scripts/verify-package.mjs"
   },
   "devDependencies": {

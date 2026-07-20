@@ -8,7 +8,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Flux, type Subscription } from "reactor-core-ts";
-import { WellKnownMimeType } from "rsocket-frames-ts";
+import { FrameType, PayloadFlag, WellKnownMimeType } from "rsocket-frames-ts";
 import {
   RequestChannelController,
   RequestResponseController,
@@ -16,6 +16,11 @@ import {
   RSocket
 } from "@";
 import type { RSocketWebSocket } from "@/types/index.js";
+import {
+  ObservedWebSocket,
+  type ObservedRSocketFrame,
+  observedRSocketFrames
+} from "./observed-websocket.js";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 const serverProject = resolve(projectRoot, "test/spring-boot-rsocket-server/pom.xml");
@@ -26,6 +31,7 @@ const serverSource = resolve(
 const serverJar = resolve(projectRoot, "test/spring-boot-rsocket-server/target/rsocket-browser-spring-boot-test-server-1.0.0.jar");
 const dataMimeType = WellKnownMimeType.APPLICATION_JSON;
 const metadataMimeType = WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA;
+const FRAGMENT_MTU = 1_024;
 
 let serverProcess: ChildProcessWithoutNullStreams | undefined;
 let serverPort = 0;
@@ -81,6 +87,20 @@ class SpringNumbersController extends RequestStreamController<{ readonly count: 
 }
 
 /**
+ * Request-stream controller whose request and response items exceed the test MTU.
+ */
+class SpringFragmentedNumbersController extends RequestStreamController<{
+  readonly count: number;
+  readonly value: string;
+}, {
+  readonly n: number;
+  readonly value: string;
+}> {
+  /** Spring route encoded into RSocket routing metadata. */
+  protected route = "fragmented-numbers";
+}
+
+/**
  * Request-channel controller bound to the Spring `channel` route.
  */
 class SpringChannelController extends RequestChannelController<{ readonly value: string }, {
@@ -124,6 +144,39 @@ describe("RSocket Spring Boot WebSocket Resume integration", () => {
     }
   });
 
+  it("fragments a routed request-response in both directions against Spring Boot", async () => {
+    const {socket, observed} = createFragmentedSocket();
+    const connected = await connectedSocket(socket);
+    const value = patternedText(12_000, "request-response");
+
+    try {
+      const response = await connected.process(new SpringEchoController(), { value }).block();
+      expect(response).toMatchObject({kind: "spring-echo", value});
+      expect(response.setups).toBeGreaterThan(0);
+
+      const wire = observed[0];
+      expect(wire).toBeDefined();
+      const sent = observedRSocketFrames(wire!.sent);
+      const initialRequest = sent.find((frame) => frame.type === FrameType.REQUEST_RESPONSE);
+      expect(initialRequest).toBeDefined();
+      const streamId = initialRequest!.streamId;
+      const requestFragments = sent.filter((frame) =>
+        frame.streamId === streamId &&
+        (frame.type === FrameType.REQUEST_RESPONSE || frame.type === FrameType.PAYLOAD)
+      );
+      const responseFragments = observedRSocketFrames(wire!.received).filter((frame) =>
+        frame.streamId === streamId && frame.type === FrameType.PAYLOAD
+      );
+
+      assertFragmentSequence(requestFragments, FrameType.REQUEST_RESPONSE, FRAGMENT_MTU);
+      assertFragmentSequence(responseFragments, FrameType.PAYLOAD, FRAGMENT_MTU);
+      expect(responseFragments.at(-1)!.flags & PayloadFlag.NEXT).toBe(PayloadFlag.NEXT);
+      expect(responseFragments.at(-1)!.flags & PayloadFlag.COMPLETE).toBe(PayloadFlag.COMPLETE);
+    } finally {
+      connected.disconnect();
+    }
+  });
+
   it("keeps request-stream demand lazy against Spring MessageMapping", async () => {
     const socket = createSocket();
     const connected = await connectedSocket(socket);
@@ -152,6 +205,64 @@ describe("RSocket Spring Boot WebSocket Resume integration", () => {
       subscription?.request(3);
       await waitFor(() => received.length === 4);
       expect(received).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }]);
+    } finally {
+      subscription?.cancel();
+      connected.disconnect();
+    }
+  });
+
+  it("counts fragmented Spring request-stream responses as logical payloads for demand", async () => {
+    const {socket, observed} = createFragmentedSocket();
+    const connected = await connectedSocket(socket);
+    const value = patternedText(8_000, "request-stream");
+    const received: Array<{ readonly n: number; readonly value: string }> = [];
+    const failures: unknown[] = [];
+    let completed = false;
+    let subscription: Subscription | undefined;
+
+    try {
+      connected.process(new SpringFragmentedNumbersController(), {count: 2, value}).subscribe({
+        onSubscribe(next: Subscription) {
+          subscription = next;
+          next.request(1);
+        },
+        onNext(next: { readonly n: number; readonly value: string }) {
+          received.push(next);
+        },
+        onError(error: unknown) {
+          failures.push(error);
+        },
+        onComplete() {
+          completed = true;
+        }
+      });
+
+      await waitFor(() => received.length === 1);
+      await delay(100);
+      expect(received).toEqual([{n: 1, value}]);
+      expect(completed).toBe(false);
+
+      subscription?.request(1);
+      await waitFor(() => completed && received.length === 2);
+      expect(received).toEqual([{n: 1, value}, {n: 2, value}]);
+      expect(failures).toHaveLength(0);
+
+      const wire = observed[0]!;
+      const sent = observedRSocketFrames(wire.sent);
+      const initialRequest = sent.find((frame) => frame.type === FrameType.REQUEST_STREAM);
+      expect(initialRequest).toBeDefined();
+      const streamId = initialRequest!.streamId;
+      const requestFragments = sent.filter((frame) =>
+        frame.streamId === streamId &&
+        (frame.type === FrameType.REQUEST_STREAM || frame.type === FrameType.PAYLOAD)
+      );
+      const responseGroups = fragmentSequences(observedRSocketFrames(wire.received).filter((frame) =>
+        frame.streamId === streamId && frame.type === FrameType.PAYLOAD
+      )).filter(isNextSequence);
+
+      assertFragmentSequence(requestFragments, FrameType.REQUEST_STREAM, FRAGMENT_MTU);
+      expect(responseGroups).toHaveLength(2);
+      for (const group of responseGroups) assertFragmentSequence(group, FrameType.PAYLOAD, FRAGMENT_MTU);
     } finally {
       subscription?.cancel();
       connected.disconnect();
@@ -192,6 +303,66 @@ describe("RSocket Spring Boot WebSocket Resume integration", () => {
         { kind: "spring-channel", value: "b" }
       ]);
       expect(failure).toBeUndefined();
+    } finally {
+      connected.disconnect();
+    }
+  });
+
+  it("preserves fragmented request-channel item boundaries against Spring Boot", async () => {
+    const {socket, observed} = createFragmentedSocket();
+    const connected = await connectedSocket(socket);
+    const first = patternedText(7_000, "channel-first");
+    const second = patternedText(9_000, "channel-second");
+    const received: Array<{ readonly kind: "spring-channel"; readonly value: string }> = [];
+    const failures: unknown[] = [];
+    let completed = false;
+
+    try {
+      connected
+        .process(new SpringChannelController(), Flux.fromArray([
+          {data: {value: first}},
+          {data: {value: second}}
+        ]))
+        .subscribe({
+          onSubscribe(subscription: Subscription) {
+            subscription.request(2);
+          },
+          onNext(value: { readonly kind: "spring-channel"; readonly value: string }) {
+            received.push(value);
+          },
+          onError(error: unknown) {
+            failures.push(error);
+          },
+          onComplete() {
+            completed = true;
+          }
+        });
+
+      await waitFor(() => completed && received.length === 2);
+      expect(received).toEqual([
+        {kind: "spring-channel", value: first},
+        {kind: "spring-channel", value: second}
+      ]);
+      expect(failures).toHaveLength(0);
+
+      const wire = observed[0]!;
+      const sent = observedRSocketFrames(wire.sent);
+      const initialRequest = sent.find((frame) => frame.type === FrameType.REQUEST_CHANNEL);
+      expect(initialRequest).toBeDefined();
+      const streamId = initialRequest!.streamId;
+      const requestGroups = fragmentSequences(sent.filter((frame) =>
+        frame.streamId === streamId &&
+        (frame.type === FrameType.REQUEST_CHANNEL || frame.type === FrameType.PAYLOAD)
+      )).filter(isNextSequence);
+      const responseGroups = fragmentSequences(observedRSocketFrames(wire.received).filter((frame) =>
+        frame.streamId === streamId && frame.type === FrameType.PAYLOAD
+      )).filter(isNextSequence);
+
+      expect(requestGroups).toHaveLength(2);
+      assertFragmentSequence(requestGroups[0]!, FrameType.PAYLOAD, FRAGMENT_MTU);
+      assertFragmentSequence(requestGroups[1]!, FrameType.PAYLOAD, FRAGMENT_MTU);
+      expect(responseGroups).toHaveLength(2);
+      for (const group of responseGroups) assertFragmentSequence(group, FrameType.PAYLOAD, FRAGMENT_MTU);
     } finally {
       connected.disconnect();
     }
@@ -381,7 +552,8 @@ function startSpringBootServer(port: number): ChildProcessWithoutNullStreams {
     `--spring.main.web-application-type=reactive`,
     `--spring.rsocket.server.mapping-path=/rsocket`,
     `--spring.rsocket.server.transport=websocket`,
-    `--test.rsocket.resume-ttl-ms=30000`
+    `--test.rsocket.resume-ttl-ms=30000`,
+    `--test.rsocket.fragment-mtu=${FRAGMENT_MTU}`
   ], {
     cwd: projectRoot
   });
@@ -482,6 +654,77 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
  */
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+/**
+ * Creates a socket whose client and Spring responder both fragment at the test MTU.
+ */
+function createFragmentedSocket(): {readonly socket: RSocket; readonly observed: ObservedWebSocket[]} {
+  const observed: ObservedWebSocket[] = [];
+  const socket = createSocket({
+    maxFrameLength: FRAGMENT_MTU,
+    transport: (url: string | URL) => {
+      const websocket = new ObservedWebSocket(url);
+      observed.push(websocket);
+      return websocket;
+    }
+  });
+  return {socket, observed};
+}
+
+/**
+ * Asserts one complete FOLLOWS sequence and its WebSocket frame boundaries.
+ */
+function assertFragmentSequence(
+  frames: readonly ObservedRSocketFrame[],
+  firstType: FrameType,
+  maxFrameLength: number
+): void {
+  expect(frames.length).toBeGreaterThan(1);
+  expect(frames[0]!.type).toBe(firstType);
+  expect(frames.slice(1).every((frame) => frame.type === FrameType.PAYLOAD)).toBe(true);
+  expect(frames.every((frame) => frame.bytes.byteLength <= maxFrameLength)).toBe(true);
+  expect(frames.slice(0, -1).every(hasFollows)).toBe(true);
+  expect(hasFollows(frames.at(-1)!)).toBe(false);
+}
+
+/**
+ * Splits consecutive wire frames at every fragment sequence boundary.
+ */
+function fragmentSequences(frames: readonly ObservedRSocketFrame[]): ObservedRSocketFrame[][] {
+  const sequences: ObservedRSocketFrame[][] = [];
+  let current: ObservedRSocketFrame[] = [];
+  for (const frame of frames) {
+    current.push(frame);
+    if (!hasFollows(frame)) {
+      sequences.push(current);
+      current = [];
+    }
+  }
+  if (current.length > 0) sequences.push(current);
+  return sequences;
+}
+
+/**
+ * Returns whether one logical PAYLOAD sequence carries an onNext signal.
+ */
+function isNextSequence(frames: readonly ObservedRSocketFrame[]): boolean {
+  return frames.some((frame) => (frame.flags & PayloadFlag.NEXT) === PayloadFlag.NEXT);
+}
+
+/**
+ * Returns whether a wire frame advertises another fragment.
+ */
+function hasFollows(frame: ObservedRSocketFrame): boolean {
+  return (frame.flags & PayloadFlag.FOLLOWS) === PayloadFlag.FOLLOWS;
+}
+
+/**
+ * Produces deterministic text large enough to require fragmentation.
+ */
+function patternedText(length: number, seed: string): string {
+  const pattern = `${seed}:`;
+  return pattern.repeat(Math.ceil(length / pattern.length)).slice(0, length);
 }
 
 /**
