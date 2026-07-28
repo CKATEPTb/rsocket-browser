@@ -1,3 +1,13 @@
+# 🚨 REPOSITORY MOVED
+
+This repository is archived and no longer maintained. Development has continued inside the monorepo.
+
+## 📦 New Location
+
+👉 **[RSocket-TS](https://github.com/CKATEPTb/rsocket-ts)**
+
+---
+
 # rsocket-browser
 
 `rsocket-browser` is a browser-first TypeScript RSocket requester for any backend
